@@ -69,18 +69,12 @@ contract Jindo {
         address indexed host, address indexed client, uint256 challengeIndex, uint256 challengeBlock
     );
     event ProofCommitted(
-        address indexed host,
-        address indexed client,
-        uint256 challengeIndex,
-        bytes32 fileRoot,
-        uint256 chunkInFileIndex
+        address indexed host, address indexed client, uint256 challengeIndex, bytes32 fileRoot, uint256 chunkInFileIndex
     );
 
     constructor() {
         DOMAIN_SEPARATOR = keccak256(
-            abi.encode(
-                DOMAIN_TYPEHASH, keccak256(bytes("Jindo")), keccak256(bytes("1")), block.chainid, address(this)
-            )
+            abi.encode(DOMAIN_TYPEHASH, keccak256(bytes("Jindo")), keccak256(bytes("1")), block.chainid, address(this))
         );
     }
 
@@ -183,8 +177,7 @@ contract Jindo {
     ) private {
         if (newSize > type(uint64).max) revert SizeOverflow();
 
-        bytes32 structHash =
-            keccak256(abi.encode(typeHash, msg.sender, client, fileRoot, priorRoot, newRoot, newSize));
+        bytes32 structHash = keccak256(abi.encode(typeHash, msg.sender, client, fileRoot, priorRoot, newRoot, newSize));
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
         if (_recover(digest, signature) != client) revert BadSignature();
 
@@ -213,13 +206,7 @@ contract Jindo {
         _rotateChallenge(k, c, msg.sender, client, uint64(newSize));
     }
 
-    function _rotateChallenge(
-        bytes32 k,
-        Contract storage c,
-        address host,
-        address client,
-        uint64 size
-    ) private {
+    function _rotateChallenge(bytes32 k, Contract storage c, address host, address client, uint64 size) private {
         if (size == 0) {
             c.challengeIndex = 0;
             // challengeBlock no longer stored
@@ -236,11 +223,7 @@ contract Jindo {
         emit ChallengeRotated(host, client, newIndex, block.number);
     }
 
-    function _verifyMerkleProof(bytes32[] calldata proof, bytes32 root, bytes32 leaf)
-        private
-        pure
-        returns (bool)
-    {
+    function _verifyMerkleProof(bytes32[] calldata proof, bytes32 root, bytes32 leaf) private pure returns (bool) {
         bytes32 computed = leaf;
         uint256 len = proof.length;
         for (uint256 i; i < len;) {

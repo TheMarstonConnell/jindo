@@ -36,20 +36,8 @@ contract JindoTest is Test {
     }
 
     function _read(address h, address c) internal view returns (Jindo.Contract memory) {
-        (
-            address rh,
-            uint64 size,
-            address rc,
-            uint64 challengeIndex,
-            bytes32 root
-        ) = jindo.contracts(jindo.key(h, c));
-        return Jindo.Contract({
-            host: rh,
-            size: size,
-            client: rc,
-            challengeIndex: challengeIndex,
-            root: root
-        });
+        (address rh, uint64 size, address rc, uint64 challengeIndex, bytes32 root) = jindo.contracts(jindo.key(h, c));
+        return Jindo.Contract({host: rh, size: size, client: rc, challengeIndex: challengeIndex, root: root});
     }
 
     function _digest(
