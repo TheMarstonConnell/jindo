@@ -11,17 +11,23 @@ import {
   type ChainContext,
 } from "../shared/chain.ts";
 import {
+  blobIsLive,
   deleteFileRow,
-  getStore,
+  fileRootRefCount,
   hasFile,
   insertFile,
   listClientSummaries,
   listFiles,
+  openHostDb,
   readState,
   writeState,
-  type ClientStore,
+  type HostDb,
 } from "./db.ts";
+import { proveOnce } from "./prove.ts";
 import type { HostEnv } from "../node/env.ts";
+
+const DEFAULT_PROVE_INTERVAL_MS = 12 * 60 * 60 * 1000; // 12 hours
+const STARTUP_DELAY_MS = 30 * 1000; // wait 30s after startup before the first sweep
 
 interface IntentBody {
   client: Address;
@@ -41,16 +47,28 @@ function withLock<T>(client: Address, fn: () => Promise<T>): Promise<T> {
   return next as Promise<T>;
 }
 
+const CORS_HEADERS: Record<string, string> = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
+  "Access-Control-Max-Age": "86400",
+};
+
+function withCors(res: Response): Response {
+  for (const [k, v] of Object.entries(CORS_HEADERS)) res.headers.set(k, v);
+  return res;
+}
+
 function jsonError(status: number, msg: string, extra: Record<string, unknown> = {}) {
-  return Response.json({ error: msg, ...extra }, { status });
+  return withCors(Response.json({ error: msg, ...extra }, { status }));
 }
 
 async function ensurePairState(
   ctx: ChainContext,
-  store: ClientStore,
+  hdb: HostDb,
   client: Address,
 ): Promise<{ outerRoot: Hex; totalSize: bigint }> {
-  const local = readState(store);
+  const local = readState(hdb, client);
   const onChain = await readPair(ctx, ctx.account, client);
   if (local.outerRoot.toLowerCase() !== onChain.outerRoot.toLowerCase()) {
     throw new Error(
@@ -60,7 +78,11 @@ async function ensurePairState(
   return { outerRoot: local.outerRoot, totalSize: local.totalSize };
 }
 
-async function handleUpload(req: Request, ctx: ChainContext, env: HostEnv): Promise<Response> {
+async function handleUpload(
+  req: Request,
+  ctx: ChainContext,
+  hdb: HostDb,
+): Promise<Response> {
   let form: Awaited<ReturnType<Request["formData"]>>;
   try {
     form = await req.formData();
@@ -103,14 +125,13 @@ async function handleUpload(req: Request, ctx: ChainContext, env: HostEnv): Prom
   }
 
   return withLock(client, async () => {
-    const store = getStore(env.dataDir, client);
-    const state = await ensurePairState(ctx, store, client);
+    const state = await ensurePairState(ctx, hdb, client);
 
     if (state.outerRoot.toLowerCase() !== intent.priorRoot.toLowerCase()) {
       return jsonError(409, "priorRoot mismatch", { currentRoot: state.outerRoot });
     }
 
-    if (hasFile(store, intent.fileRoot)) {
+    if (hasFile(hdb, client, intent.fileRoot)) {
       return jsonError(409, "file already in set", { currentRoot: state.outerRoot });
     }
 
@@ -121,7 +142,7 @@ async function handleUpload(req: Request, ctx: ChainContext, env: HostEnv): Prom
     }
 
     const expectedNewRoot = computeOuterRoot([
-      ...listFiles(store),
+      ...listFiles(hdb, client),
       { fileRoot: computedFileRoot, sizeBytes: bytes.byteLength, uploadedAt: 0 },
     ]);
     if (expectedNewRoot.toLowerCase() !== intent.newRoot.toLowerCase()) {
@@ -135,7 +156,8 @@ async function handleUpload(req: Request, ctx: ChainContext, env: HostEnv): Prom
       });
     }
 
-    const blobPath = `${store.blobsDir}/${intent.fileRoot}`;
+    const blobPath = `${hdb.blobsDir}/${intent.fileRoot}`;
+    const blobExistedBefore = existsSync(blobPath);
 
     let txHash: Hex;
     try {
@@ -154,19 +176,21 @@ async function handleUpload(req: Request, ctx: ChainContext, env: HostEnv): Prom
 
     try {
       await Bun.write(blobPath, bytes);
-      const tx = store.db.transaction(() => {
-        insertFile(store, {
+      const tx = hdb.db.transaction(() => {
+        insertFile(hdb, client, {
           fileRoot: intent.fileRoot,
           sizeBytes: bytes.byteLength,
           uploadedAt: Math.floor(Date.now() / 1000),
         });
-        writeState(store, { outerRoot: intent.newRoot, totalSize: newSize }, txHash);
+        writeState(hdb, client, { outerRoot: intent.newRoot, totalSize: newSize }, txHash);
       });
       tx();
     } catch (e) {
-      // Tx is on-chain but local persistence failed — try to roll back db then surface.
+      // Chain tx is committed but local persistence failed.
+      // Only unlink the blob if we created it on this request — otherwise another
+      // client still references it and we'd corrupt their state.
       try {
-        if (existsSync(blobPath)) unlinkSync(blobPath);
+        if (!blobExistedBefore && existsSync(blobPath)) unlinkSync(blobPath);
       } catch {}
       return jsonError(500, "chain succeeded but local persistence failed", {
         detail: String(e),
@@ -174,11 +198,15 @@ async function handleUpload(req: Request, ctx: ChainContext, env: HostEnv): Prom
       });
     }
 
-    return Response.json({ txHash, outerRoot: intent.newRoot });
+    return withCors(Response.json({ txHash, outerRoot: intent.newRoot }));
   });
 }
 
-async function handleDelete(req: Request, ctx: ChainContext, env: HostEnv): Promise<Response> {
+async function handleDelete(
+  req: Request,
+  ctx: ChainContext,
+  hdb: HostDb,
+): Promise<Response> {
   let intent: IntentBody;
   try {
     intent = (await req.json()) as IntentBody;
@@ -209,17 +237,16 @@ async function handleDelete(req: Request, ctx: ChainContext, env: HostEnv): Prom
   }
 
   return withLock(client, async () => {
-    const store = getStore(env.dataDir, client);
-    const state = await ensurePairState(ctx, store, client);
+    const state = await ensurePairState(ctx, hdb, client);
 
     if (state.outerRoot.toLowerCase() !== intent.priorRoot.toLowerCase()) {
       return jsonError(409, "priorRoot mismatch", { currentRoot: state.outerRoot });
     }
-    if (!hasFile(store, intent.fileRoot)) {
+    if (!hasFile(hdb, client, intent.fileRoot)) {
       return jsonError(404, "unknown file_root");
     }
 
-    const remaining = listFiles(store).filter(
+    const remaining = listFiles(hdb, client).filter(
       (f) => f.fileRoot.toLowerCase() !== intent.fileRoot.toLowerCase(),
     );
     const expectedNewRoot = computeOuterRoot(remaining);
@@ -227,7 +254,7 @@ async function handleDelete(req: Request, ctx: ChainContext, env: HostEnv): Prom
       return jsonError(400, "newRoot does not match expected outer root after deletion");
     }
 
-    const blobPath = `${store.blobsDir}/${intent.fileRoot}`;
+    const blobPath = `${hdb.blobsDir}/${intent.fileRoot}`;
     let removedSize: number;
     try {
       removedSize = Bun.file(blobPath).size;
@@ -255,13 +282,16 @@ async function handleDelete(req: Request, ctx: ChainContext, env: HostEnv): Prom
     }
 
     try {
-      const tx = store.db.transaction(() => {
-        deleteFileRow(store, intent.fileRoot);
-        writeState(store, { outerRoot: intent.newRoot, totalSize: newSize }, txHash);
+      const tx = hdb.db.transaction(() => {
+        deleteFileRow(hdb, client, intent.fileRoot);
+        writeState(hdb, client, { outerRoot: intent.newRoot, totalSize: newSize }, txHash);
       });
       tx();
+      // Refcounted blob removal: only unlink when no other client still references this fileRoot.
       try {
-        if (existsSync(blobPath)) unlinkSync(blobPath);
+        if (fileRootRefCount(hdb, intent.fileRoot) === 0 && existsSync(blobPath)) {
+          unlinkSync(blobPath);
+        }
       } catch {}
     } catch (e) {
       return jsonError(500, "chain succeeded but local persistence failed", {
@@ -270,31 +300,53 @@ async function handleDelete(req: Request, ctx: ChainContext, env: HostEnv): Prom
       });
     }
 
-    return Response.json({ txHash, outerRoot: intent.newRoot });
+    return withCors(Response.json({ txHash, outerRoot: intent.newRoot }));
   });
 }
 
-function handleList(client: Address, env: HostEnv): Response {
+function handleList(client: Address, hdb: HostDb): Response {
   if (!isAddress(client)) return jsonError(400, "invalid client address");
   const checked = getAddress(client);
-  const store = getStore(env.dataDir, checked);
-  const state = readState(store);
-  const files = listFiles(store);
-  return Response.json({
+  const state = readState(hdb, checked);
+  const files = listFiles(hdb, checked);
+  return withCors(Response.json({
     outerRoot: state.outerRoot,
     totalSize: state.totalSize.toString(),
     files,
-  });
+  }));
 }
 
-async function handleDownload(client: Address, fileRoot: Hex, env: HostEnv): Promise<Response> {
-  if (!isAddress(client)) return jsonError(400, "invalid client address");
-  const checked = getAddress(client);
-  const store = getStore(env.dataDir, checked);
-  if (!hasFile(store, fileRoot)) return jsonError(404, "not found");
-  const file = Bun.file(`${store.blobsDir}/${fileRoot}`);
+async function handleDownload(fileRoot: Hex, hdb: HostDb): Promise<Response> {
+  // Only serve blobs that are currently referenced by some client.
+  // A file deleted by every client has its blob removed; this guards against
+  // someone hitting a stale fileRoot URL after deletion.
+  if (!blobIsLive(hdb, fileRoot)) return jsonError(404, "not found");
+  const file = Bun.file(`${hdb.blobsDir}/${fileRoot}`);
   if (!(await file.exists())) return jsonError(404, "not found");
-  return new Response(file);
+  return withCors(new Response(file));
+}
+
+async function proveAllClients(ctx: ChainContext, hdb: HostDb, env: HostEnv): Promise<void> {
+  const summaries = listClientSummaries(hdb);
+  console.log(`[prove-all] sweep starting for ${summaries.length} client(s)`);
+  for (const s of summaries) {
+    if (s.totalSize === "0") {
+      console.log(`[prove-all] ${s.client}: empty, skipping`);
+      continue;
+    }
+    try {
+      const result = await withLock(s.client, () => proveOnce(ctx, hdb, env, s.client));
+      console.log(
+        `[prove-all] ${s.client}: ok challengeIndex=${result.challengeIndex} fileRoot=${result.fileRoot} tx=${result.txHash}`,
+      );
+    } catch (e) {
+      console.error(
+        `[prove-all] ${s.client}: failed —`,
+        e instanceof Error ? e.message : String(e),
+      );
+    }
+  }
+  console.log(`[prove-all] sweep done`);
 }
 
 export async function startHost(env: HostEnv): Promise<{ stop: () => void; url: string }> {
@@ -304,19 +356,38 @@ export async function startHost(env: HostEnv): Promise<{ stop: () => void; url: 
     contract: env.contract,
   });
 
+  const hdb = openHostDb(env.dataDir);
+
+  const corsPreflight = () => withCors(new Response(null, { status: 204 }));
+
   const server = Bun.serve({
     port: env.port,
     hostname: "0.0.0.0",
     routes: {
-      "/health": () =>
-        Response.json({ address: ctx.account, chainId: ctx.chainId, contract: ctx.contract }),
-      "/upload": { POST: (req) => handleUpload(req, ctx, env) },
-      "/delete": { POST: (req) => handleDelete(req, ctx, env) },
-      "/clients": () =>
-        Response.json({ host: ctx.account, clients: listClientSummaries(env.dataDir) }),
-      "/list/:client": (req) => handleList(req.params.client as Address, env),
-      "/download/:client/:fileRoot": (req) =>
-        handleDownload(req.params.client as Address, req.params.fileRoot as Hex, env),
+      "/health": {
+        GET: () =>
+          withCors(
+            Response.json({ address: ctx.account, chainId: ctx.chainId, contract: ctx.contract }),
+          ),
+        OPTIONS: corsPreflight,
+      },
+      "/upload": { POST: (req) => handleUpload(req, ctx, hdb), OPTIONS: corsPreflight },
+      "/delete": { POST: (req) => handleDelete(req, ctx, hdb), OPTIONS: corsPreflight },
+      "/clients": {
+        GET: () =>
+          withCors(
+            Response.json({ host: ctx.account, clients: listClientSummaries(hdb) }),
+          ),
+        OPTIONS: corsPreflight,
+      },
+      "/list/:client": {
+        GET: (req) => handleList(req.params.client as Address, hdb),
+        OPTIONS: corsPreflight,
+      },
+      "/download/:fileRoot": {
+        GET: (req) => handleDownload(req.params.fileRoot as Hex, hdb),
+        OPTIONS: corsPreflight,
+      },
     },
     fetch: () => new Response("not found", { status: 404 }),
   });
@@ -325,8 +396,41 @@ export async function startHost(env: HostEnv): Promise<{ stop: () => void; url: 
     `jindo host listening on ${server.url} as ${ctx.account} (chain ${ctx.chainId}, contract ${ctx.contract})`,
   );
 
+  const intervalMs = Number(process.env.JINDO_PROVE_INTERVAL_MS ?? DEFAULT_PROVE_INTERVAL_MS);
+  let proveTimer: Timer | null = null;
+  let proveInflight = false;
+  const runProveAll = async () => {
+    if (proveInflight) {
+      console.log("[prove-all] previous sweep still running, skipping this tick");
+      return;
+    }
+    proveInflight = true;
+    try {
+      await proveAllClients(ctx, hdb, env);
+    } catch (e) {
+      console.error("[prove-all] sweep crashed:", e);
+    } finally {
+      proveInflight = false;
+    }
+  };
+
+  if (intervalMs > 0) {
+    console.log(
+      `[prove-all] scheduled every ${intervalMs}ms (first sweep in ${STARTUP_DELAY_MS}ms)`,
+    );
+    setTimeout(() => {
+      void runProveAll();
+      proveTimer = setInterval(() => void runProveAll(), intervalMs);
+    }, STARTUP_DELAY_MS);
+  } else {
+    console.log("[prove-all] disabled (JINDO_PROVE_INTERVAL_MS=0)");
+  }
+
   return {
-    stop: () => server.stop(true),
+    stop: () => {
+      if (proveTimer) clearInterval(proveTimer);
+      server.stop(true);
+    },
     url: server.url.toString(),
   };
 }

@@ -25,7 +25,9 @@ export async function postUpload(
 ): Promise<{ txHash: Hex; outerRoot: Hex }> {
   const form = new FormData();
   form.append("intent", JSON.stringify(intent));
-  form.append("file", new Blob([bytes]), filename);
+  // Cast: viem-style Uint8Array<ArrayBufferLike> isn't assignable to BlobPart's
+  // expected ArrayBufferView<ArrayBuffer>, but at runtime it's a perfectly valid Blob source.
+  form.append("file", new Blob([bytes as BlobPart]), filename);
   const res = await fetch(`${stripTrail(hostUrl)}/upload`, { method: "POST", body: form });
   if (!res.ok) throw new Error(`upload failed (${res.status}): ${await res.text()}`);
   return (await res.json()) as { txHash: Hex; outerRoot: Hex };

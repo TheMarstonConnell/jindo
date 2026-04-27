@@ -4,19 +4,32 @@ pragma solidity ^0.8.13;
 contract Jindo {
     uint256 public constant CHUNK_SIZE = 1024;
 
+    /// @dev Packed into 3 storage slots:
+    ///   slot 0: host (20) | size (8) | _pad (4)
+    ///   slot 1: client (20) | challengeIndex (8) | _pad (4)
+    ///   slot 2: root (32)
+    /// Sizes are uint64 (~18 EB) which is more than enough for any practical file set.
+    /// challengeBlock is no longer stored — block.number is emitted in ChallengeRotated.
     struct Contract {
         address host;
+        uint64 size;
         address client;
+        uint64 challengeIndex;
         bytes32 root;
-        uint256 size;
-        uint256 challengeIndex;
-        uint256 challengeBlock;
     }
 
     mapping(bytes32 => Contract) public contracts;
 
     mapping(address => address[]) public clientsOfHost;
     mapping(address => address[]) public hostsOfClient;
+
+    function getHostsOfClient(address client) external view returns (address[] memory) {
+        return hostsOfClient[client];
+    }
+
+    function getClientsOfHost(address host) external view returns (address[] memory) {
+        return clientsOfHost[host];
+    }
 
     // 1-based index into the arrays above; 0 means "not present"
     mapping(address => mapping(address => uint256)) private clientIndexOfHost;
@@ -32,6 +45,20 @@ contract Jindo {
     );
 
     bytes32 public immutable DOMAIN_SEPARATOR;
+
+    error NotAuthorized();
+    error NoData();
+    error FileOverflow();
+    error ChallengeBeforeFile();
+    error ChallengeAfterFile();
+    error WrongChunkIndex();
+    error WrongChunkLength();
+    error BadOuterProof();
+    error BadFileProof();
+    error BadSignature();
+    error PriorRootRequiredZero();
+    error PriorRootMismatch();
+    error SizeOverflow();
 
     event ContractCreated(address indexed host, address indexed client, bytes32 root, uint256 size);
     event ContractUpdated(
@@ -57,8 +84,13 @@ contract Jindo {
         );
     }
 
-    function key(address host, address client) public pure returns (bytes32) {
-        return keccak256(abi.encodePacked(host, client));
+    function key(address host, address client) public pure returns (bytes32 result) {
+        assembly {
+            // Layout 40 bytes: host (20) || client (20) at memory[0..40), then hash.
+            mstore(0x00, shl(96, host))
+            mstore(0x14, shl(96, client))
+            result := keccak256(0x00, 0x28)
+        }
     }
 
     function commitUpload(
@@ -85,7 +117,7 @@ contract Jindo {
 
     function remove(address client) external {
         bytes32 k = key(msg.sender, client);
-        require(contracts[k].host == msg.sender, "not authorized");
+        if (contracts[k].host != msg.sender) revert NotAuthorized();
 
         _removeFrom(clientsOfHost[msg.sender], clientIndexOfHost[msg.sender], client);
         _removeFrom(hostsOfClient[client], hostIndexOfClient[client], msg.sender);
@@ -108,16 +140,15 @@ contract Jindo {
     ) external {
         bytes32 k = key(msg.sender, client);
         Contract storage c = contracts[k];
-        require(c.host == msg.sender, "not authorized");
-        require(c.size > 0, "no data to challenge");
+        if (c.host != msg.sender) revert NotAuthorized();
+        uint256 cSize = c.size;
+        if (cSize == 0) revert NoData();
 
-        uint256 challengeByte = c.challengeIndex * CHUNK_SIZE;
-        require(cumulativeBytesBefore + fileSize <= c.size, "file overflows total");
-        require(cumulativeBytesBefore <= challengeByte, "challenge before file");
-        require(challengeByte < cumulativeBytesBefore + fileSize, "challenge after file");
-        require(
-            chunkInFileIndex == (challengeByte - cumulativeBytesBefore) / CHUNK_SIZE, "wrong chunk index"
-        );
+        uint256 challengeByte = uint256(c.challengeIndex) * CHUNK_SIZE;
+        if (cumulativeBytesBefore + fileSize > cSize) revert FileOverflow();
+        if (cumulativeBytesBefore > challengeByte) revert ChallengeBeforeFile();
+        if (challengeByte >= cumulativeBytesBefore + fileSize) revert ChallengeAfterFile();
+        if (chunkInFileIndex != (challengeByte - cumulativeBytesBefore) / CHUNK_SIZE) revert WrongChunkIndex();
 
         // The chunk at the last index of a file may be shorter than CHUNK_SIZE.
         uint256 expectedLen;
@@ -127,18 +158,18 @@ contract Jindo {
         } else {
             expectedLen = CHUNK_SIZE;
         }
-        require(chunkBytes.length == expectedLen, "wrong chunk length");
+        if (chunkBytes.length != expectedLen) revert WrongChunkLength();
 
         // Outer-tree leaf binds (cumulativeBytesBefore, fileSize, fileRoot).
         bytes32 outerLeaf = keccak256(abi.encode(cumulativeBytesBefore, fileSize, fileRoot));
-        require(_verifyMerkleProof(outerProof, c.root, outerLeaf), "bad outer proof");
+        if (!_verifyMerkleProof(outerProof, c.root, outerLeaf)) revert BadOuterProof();
 
         // File-tree leaf binds (chunkInFileIndex, chunkBytes).
         bytes32 fileLeafHash = keccak256(abi.encode(chunkInFileIndex, chunkBytes));
-        require(_verifyMerkleProof(fileProof, fileRoot, fileLeafHash), "bad file proof");
+        if (!_verifyMerkleProof(fileProof, fileRoot, fileLeafHash)) revert BadFileProof();
 
         emit ProofCommitted(msg.sender, client, c.challengeIndex, fileRoot, chunkInFileIndex);
-        _rotateChallenge(k, c);
+        _rotateChallenge(k, c, msg.sender, client, uint64(cSize));
     }
 
     function _verifyAndCommit(
@@ -150,19 +181,21 @@ contract Jindo {
         uint256 newSize,
         bytes calldata signature
     ) private {
+        if (newSize > type(uint64).max) revert SizeOverflow();
+
         bytes32 structHash =
             keccak256(abi.encode(typeHash, msg.sender, client, fileRoot, priorRoot, newRoot, newSize));
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
-        require(_recover(digest, signature) == client, "bad signature");
+        if (_recover(digest, signature) != client) revert BadSignature();
 
         bytes32 k = key(msg.sender, client);
         Contract storage c = contracts[k];
         if (c.host == address(0)) {
-            require(priorRoot == bytes32(0), "first commit needs priorRoot=0");
+            if (priorRoot != bytes32(0)) revert PriorRootRequiredZero();
             c.host = msg.sender;
             c.client = client;
             c.root = newRoot;
-            c.size = newSize;
+            c.size = uint64(newSize);
 
             clientsOfHost[msg.sender].push(client);
             clientIndexOfHost[msg.sender][client] = clientsOfHost[msg.sender].length;
@@ -171,27 +204,36 @@ contract Jindo {
 
             emit ContractCreated(msg.sender, client, newRoot, newSize);
         } else {
-            require(c.root == priorRoot, "priorRoot mismatch");
+            if (c.root != priorRoot) revert PriorRootMismatch();
             bytes32 oldRoot = c.root;
             c.root = newRoot;
-            c.size = newSize;
+            c.size = uint64(newSize);
             emit ContractUpdated(msg.sender, client, oldRoot, newRoot, newSize);
         }
-        _rotateChallenge(k, c);
+        _rotateChallenge(k, c, msg.sender, client, uint64(newSize));
     }
 
-    function _rotateChallenge(bytes32 k, Contract storage c) private {
-        if (c.size == 0) {
+    function _rotateChallenge(
+        bytes32 k,
+        Contract storage c,
+        address host,
+        address client,
+        uint64 size
+    ) private {
+        if (size == 0) {
             c.challengeIndex = 0;
-            c.challengeBlock = 0;
+            // challengeBlock no longer stored
             return;
         }
-        uint256 totalChunks = (c.size + CHUNK_SIZE - 1) / CHUNK_SIZE;
-        bytes32 prevHash = block.number == 0 ? bytes32(0) : blockhash(block.number - 1);
+        uint256 totalChunks;
+        unchecked {
+            totalChunks = (uint256(size) + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        }
+        bytes32 prevHash = blockhash(block.number - 1);
         uint256 seed = uint256(keccak256(abi.encodePacked(prevHash, k, c.root)));
-        c.challengeIndex = seed % totalChunks;
-        c.challengeBlock = block.number;
-        emit ChallengeRotated(c.host, c.client, c.challengeIndex, c.challengeBlock);
+        uint64 newIndex = uint64(seed % totalChunks);
+        c.challengeIndex = newIndex;
+        emit ChallengeRotated(host, client, newIndex, block.number);
     }
 
     function _verifyMerkleProof(bytes32[] calldata proof, bytes32 root, bytes32 leaf)
@@ -200,11 +242,24 @@ contract Jindo {
         returns (bool)
     {
         bytes32 computed = leaf;
-        for (uint256 i = 0; i < proof.length; i++) {
+        uint256 len = proof.length;
+        for (uint256 i; i < len;) {
             bytes32 sib = proof[i];
-            computed = computed < sib
-                ? keccak256(abi.encodePacked(computed, sib))
-                : keccak256(abi.encodePacked(sib, computed));
+            assembly {
+                switch lt(computed, sib)
+                case 1 {
+                    mstore(0x00, computed)
+                    mstore(0x20, sib)
+                }
+                default {
+                    mstore(0x00, sib)
+                    mstore(0x20, computed)
+                }
+                computed := keccak256(0x00, 0x40)
+            }
+            unchecked {
+                ++i;
+            }
         }
         return computed == root;
     }

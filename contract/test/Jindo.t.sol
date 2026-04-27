@@ -38,19 +38,17 @@ contract JindoTest is Test {
     function _read(address h, address c) internal view returns (Jindo.Contract memory) {
         (
             address rh,
+            uint64 size,
             address rc,
-            bytes32 root,
-            uint256 size,
-            uint256 challengeIndex,
-            uint256 challengeBlock
+            uint64 challengeIndex,
+            bytes32 root
         ) = jindo.contracts(jindo.key(h, c));
         return Jindo.Contract({
             host: rh,
-            client: rc,
-            root: root,
             size: size,
+            client: rc,
             challengeIndex: challengeIndex,
-            challengeBlock: challengeBlock
+            root: root
         });
     }
 
@@ -132,21 +130,21 @@ contract JindoTest is Test {
         // signed with the wrong priorRoot
         bytes memory sig2 = _signUpload(CLIENT_PK, host, client, FILE_ROOT_2, ROOT_2, ROOT_1, 250);
         vm.prank(host);
-        vm.expectRevert(bytes("priorRoot mismatch"));
+        vm.expectRevert(Jindo.PriorRootMismatch.selector);
         jindo.commitUpload(client, FILE_ROOT_2, ROOT_2, ROOT_1, 250, sig2);
     }
 
     function test_commitUpload_revertsIfFirstCallHasNonZeroPriorRoot() public {
         bytes memory sig = _signUpload(CLIENT_PK, host, client, FILE_ROOT_1, ROOT_1, ROOT_2, 100);
         vm.prank(host);
-        vm.expectRevert(bytes("first commit needs priorRoot=0"));
+        vm.expectRevert(Jindo.PriorRootRequiredZero.selector);
         jindo.commitUpload(client, FILE_ROOT_1, ROOT_1, ROOT_2, 100, sig);
     }
 
     function test_commitUpload_revertsOnSignatureFromWrongKey() public {
         bytes memory sig = _signUpload(OTHER_PK, host, client, FILE_ROOT_1, bytes32(0), ROOT_1, 100);
         vm.prank(host);
-        vm.expectRevert(bytes("bad signature"));
+        vm.expectRevert(Jindo.BadSignature.selector);
         jindo.commitUpload(client, FILE_ROOT_1, bytes32(0), ROOT_1, 100, sig);
     }
 
@@ -154,7 +152,7 @@ contract JindoTest is Test {
         bytes memory sig = _signUpload(CLIENT_PK, host, client, FILE_ROOT_1, bytes32(0), ROOT_1, 100);
         // host inflates the size in the call
         vm.prank(host);
-        vm.expectRevert(bytes("bad signature"));
+        vm.expectRevert(Jindo.BadSignature.selector);
         jindo.commitUpload(client, FILE_ROOT_1, bytes32(0), ROOT_1, 999, sig);
     }
 
@@ -162,7 +160,7 @@ contract JindoTest is Test {
         // Sig was issued for `host`, but `otherHost` tries to use it
         bytes memory sig = _signUpload(CLIENT_PK, host, client, FILE_ROOT_1, bytes32(0), ROOT_1, 100);
         vm.prank(otherHost);
-        vm.expectRevert(bytes("bad signature"));
+        vm.expectRevert(Jindo.BadSignature.selector);
         jindo.commitUpload(client, FILE_ROOT_1, bytes32(0), ROOT_1, 100, sig);
     }
 
@@ -170,7 +168,7 @@ contract JindoTest is Test {
         // Delete-typed signature should not pass commitUpload (different type hash)
         bytes memory sig = _signDelete(CLIENT_PK, host, client, FILE_ROOT_1, bytes32(0), ROOT_1, 100);
         vm.prank(host);
-        vm.expectRevert(bytes("bad signature"));
+        vm.expectRevert(Jindo.BadSignature.selector);
         jindo.commitUpload(client, FILE_ROOT_1, bytes32(0), ROOT_1, 100, sig);
     }
 
@@ -197,7 +195,7 @@ contract JindoTest is Test {
 
         bytes memory wrongSig = _signUpload(CLIENT_PK, host, client, FILE_ROOT_1, ROOT_1, bytes32(0), 0);
         vm.prank(host);
-        vm.expectRevert(bytes("bad signature"));
+        vm.expectRevert(Jindo.BadSignature.selector);
         jindo.commitDelete(client, FILE_ROOT_1, ROOT_1, bytes32(0), 0, wrongSig);
     }
 
@@ -220,7 +218,7 @@ contract JindoTest is Test {
         jindo.commitUpload(client, FILE_ROOT_1, bytes32(0), ROOT_1, 100, sig);
 
         vm.prank(otherHost);
-        vm.expectRevert(bytes("not authorized"));
+        vm.expectRevert(Jindo.NotAuthorized.selector);
         jindo.remove(client);
     }
 
@@ -289,7 +287,6 @@ contract JindoTest is Test {
         jindo.commitUpload(client, fr, bytes32(0), outerRoot, 2048, upSig);
 
         Jindo.Contract memory c = _read(host, client);
-        assertEq(c.challengeBlock, block.number);
         assertTrue(c.challengeIndex < 2);
 
         bytes memory targetChunk;
@@ -312,14 +309,13 @@ contract JindoTest is Test {
         vm.prank(host);
         jindo.commitProof(client, 0, 2048, fr, c.challengeIndex, targetChunk, outerProof, fileProof);
 
-        Jindo.Contract memory c2 = _read(host, client);
-        assertEq(c2.challengeBlock, block.number);
+        // After commitProof the challenge is rotated again — verifying it didn't revert is sufficient.
     }
 
     function test_commitProof_revertsIfNoData() public {
         bytes32[] memory empty = new bytes32[](0);
         vm.prank(host);
-        vm.expectRevert(bytes("not authorized"));
+        vm.expectRevert(Jindo.NotAuthorized.selector);
         jindo.commitProof(client, 0, 0, bytes32(0), 0, "", empty, empty);
     }
 
@@ -336,7 +332,7 @@ contract JindoTest is Test {
         bytes32 fakeFr = keccak256("totally fake");
         bytes32[] memory empty = new bytes32[](0);
         vm.prank(host);
-        vm.expectRevert(bytes("bad outer proof"));
+        vm.expectRevert(Jindo.BadOuterProof.selector);
         jindo.commitProof(client, 0, 1024, fakeFr, 0, chunk, empty, empty);
     }
 
@@ -353,7 +349,7 @@ contract JindoTest is Test {
         tampered[0] = 0x01; // any single byte difference
         bytes32[] memory empty = new bytes32[](0);
         vm.prank(host);
-        vm.expectRevert(bytes("bad file proof"));
+        vm.expectRevert(Jindo.BadFileProof.selector);
         jindo.commitProof(client, 0, 1024, fr, 0, tampered, empty, empty);
     }
 
@@ -369,7 +365,7 @@ contract JindoTest is Test {
         bytes memory shortChunk = new bytes(512);
         bytes32[] memory empty = new bytes32[](0);
         vm.prank(host);
-        vm.expectRevert(bytes("wrong chunk length"));
+        vm.expectRevert(Jindo.WrongChunkLength.selector);
         jindo.commitProof(client, 0, 1024, fr, 0, shortChunk, empty, empty);
     }
 
@@ -384,7 +380,7 @@ contract JindoTest is Test {
 
         bytes32[] memory empty = new bytes32[](0);
         vm.prank(host);
-        vm.expectRevert(bytes("file overflows total"));
+        vm.expectRevert(Jindo.FileOverflow.selector);
         // claim fileSize=2048 > c.size=1024
         jindo.commitProof(client, 0, 2048, fr, 0, chunk, empty, empty);
     }

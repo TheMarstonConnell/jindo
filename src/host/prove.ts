@@ -9,7 +9,7 @@ import {
 import { fileMerkleProof, locateOffset, outerMerkleProof } from "../shared/merkle.ts";
 import { CHUNK_SIZE } from "../shared/types.ts";
 import type { HostEnv } from "../node/env.ts";
-import { getStore, listFiles } from "./db.ts";
+import { listFiles, openHostDb, type HostDb } from "./db.ts";
 
 export interface ProveResult {
   txHash: Hex;
@@ -18,9 +18,10 @@ export interface ProveResult {
   chunkInFileIndex: number;
 }
 
-async function proveOnce(
+export async function proveOnce(
   ctx: ChainContext,
-  env: HostEnv,
+  hdb: HostDb,
+  _env: HostEnv,
   client: Address,
 ): Promise<ProveResult> {
   const checked = getAddress(client);
@@ -28,8 +29,7 @@ async function proveOnce(
   if (onChain.totalSize === 0n) throw new Error("nothing to prove for this client");
 
   const challengeByte = onChain.challengeIndex * BigInt(CHUNK_SIZE);
-  const store = getStore(env.dataDir, checked);
-  const files = listFiles(store);
+  const files = listFiles(hdb, checked);
   const local = files.reduce((acc, f) => acc + BigInt(f.sizeBytes), 0n);
   if (local !== onChain.totalSize) {
     throw new Error(
@@ -40,7 +40,7 @@ async function proveOnce(
   const located = locateOffset(files, challengeByte);
   if (!located) throw new Error(`could not locate file for challenge byte ${challengeByte}`);
 
-  const blob = Bun.file(`${store.blobsDir}/${located.record.fileRoot}`);
+  const blob = Bun.file(`${hdb.blobsDir}/${located.record.fileRoot}`);
   if (!(await blob.exists())) throw new Error(`blob missing: ${located.record.fileRoot}`);
   const bytes = new Uint8Array(await blob.arrayBuffer());
   if (bytes.byteLength !== located.record.sizeBytes) {
@@ -78,5 +78,6 @@ export async function prove(env: HostEnv, client: Address): Promise<ProveResult>
     privateKey: env.privateKey,
     contract: env.contract,
   });
-  return proveOnce(ctx, env, client);
+  const hdb = openHostDb(env.dataDir);
+  return proveOnce(ctx, hdb, env, client);
 }

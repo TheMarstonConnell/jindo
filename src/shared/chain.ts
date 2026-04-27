@@ -31,13 +31,29 @@ export async function buildChainContext(opts: {
   };
 }
 
+export async function buildChainContextFromWallet(opts: {
+  publicClient: PublicClient;
+  walletClient: WalletClient;
+  contract: Address;
+}): Promise<ChainContext> {
+  const account = opts.walletClient.account;
+  if (!account) throw new Error("walletClient has no account attached");
+  const chainId = await opts.publicClient.getChainId();
+  return {
+    chainId,
+    contract: opts.contract,
+    publicClient: opts.publicClient,
+    walletClient: opts.walletClient,
+    account: account.address,
+  };
+}
+
 export interface OnChainPair {
   host: Address;
   client: Address;
   outerRoot: Hex;
   totalSize: bigint;
   challengeIndex: bigint;
-  challengeBlock: bigint;
 }
 
 export async function readPair(
@@ -52,12 +68,12 @@ export async function readPair(
     args: [host, client],
   })) as Hex;
 
-  const [h, c, root, size, challengeIndex, challengeBlock] = (await ctx.publicClient.readContract({
+  const [h, size, c, challengeIndex, root] = (await ctx.publicClient.readContract({
     address: ctx.contract,
     abi: JINDO_ABI,
     functionName: "contracts",
     args: [key],
-  })) as readonly [Address, Address, Hex, bigint, bigint, bigint];
+  })) as readonly [Address, bigint, Address, bigint, Hex];
 
   return {
     host: h,
@@ -65,7 +81,6 @@ export async function readPair(
     outerRoot: root,
     totalSize: size,
     challengeIndex,
-    challengeBlock,
   };
 }
 

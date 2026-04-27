@@ -1,6 +1,7 @@
 export { JindoClient } from "./client.ts";
-export type { JindoClientOptions } from "./client.ts";
+export type { JindoClientOptions, JindoClientFromContextOptions } from "./client.ts";
 export type { CacheStore, CacheFactory } from "./cache.ts";
+export { memoryCacheFactory } from "./memory-cache.ts";
 export {
   fetchHostAddress,
   fetchList,
@@ -24,6 +25,7 @@ export type { IntentKind, IntentMessage } from "../shared/eip712.ts";
 export { JINDO_ABI } from "../shared/abi.ts";
 export {
   buildChainContext,
+  buildChainContextFromWallet,
   readPair,
   submitCommitUpload,
   submitCommitDelete,

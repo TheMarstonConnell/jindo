@@ -1,5 +1,4 @@
 import type { Address, Hex } from "viem";
-import { privateKeyToAccount } from "viem/accounts";
 import { buildDomain, TYPES } from "../shared/eip712.ts";
 import { fileRoot as computeFileRoot, outerRoot as computeOuterRoot } from "../shared/merkle.ts";
 import { buildChainContext, readPair, type ChainContext } from "../shared/chain.ts";
@@ -15,9 +14,14 @@ export interface JindoClientOptions {
   openCache: CacheFactory;
 }
 
+export interface JindoClientFromContextOptions {
+  hostUrl: string;
+  openCache: CacheFactory;
+}
+
 export class JindoClient {
   private constructor(
-    private readonly opts: JindoClientOptions,
+    private readonly hostUrl: string,
     private readonly ctx: ChainContext,
     public readonly hostAddress: Address,
     private readonly cache: CacheStore,
@@ -29,9 +33,16 @@ export class JindoClient {
       privateKey: opts.privateKey,
       contract: opts.contract,
     });
+    return JindoClient.fromContext(ctx, { hostUrl: opts.hostUrl, openCache: opts.openCache });
+  }
+
+  static async fromContext(
+    ctx: ChainContext,
+    opts: JindoClientFromContextOptions,
+  ): Promise<JindoClient> {
     const hostAddress = await fetchHostAddress(opts.hostUrl);
     const cache = await opts.openCache(hostAddress, ctx.account);
-    return new JindoClient(opts, ctx, hostAddress, cache);
+    return new JindoClient(opts.hostUrl, ctx, hostAddress, cache);
   }
 
   get clientAddress(): Address {
@@ -57,9 +68,30 @@ export class JindoClient {
     return local;
   }
 
+  private async signIntent(
+    primaryType: "Upload" | "Delete",
+    message: {
+      host: Address;
+      client: Address;
+      fileRoot: Hex;
+      priorRoot: Hex;
+      newRoot: Hex;
+      newSize: bigint;
+    },
+  ): Promise<Hex> {
+    const account = this.ctx.walletClient.account;
+    if (!account) throw new Error("walletClient missing an account");
+    return this.ctx.walletClient.signTypedData({
+      account,
+      domain: buildDomain(this.ctx.chainId, this.ctx.contract),
+      types: TYPES,
+      primaryType,
+      message,
+    });
+  }
+
   async upload(bytes: Uint8Array): Promise<Hex> {
     if (bytes.byteLength === 0) throw new Error("cannot upload empty file");
-    const account = privateKeyToAccount(this.opts.privateKey);
     const local = await this.assertCacheInSync();
 
     const fileRootHex = computeFileRoot(bytes);
@@ -71,23 +103,16 @@ export class JindoClient {
     const newRoot = computeOuterRoot([...this.cache.listFiles(), newFile]);
     const newSize = local.totalSize + BigInt(bytes.byteLength);
 
-    const message = {
+    const signature = await this.signIntent("Upload", {
       host: this.hostAddress,
       client: this.clientAddress,
       fileRoot: fileRootHex,
       priorRoot: local.outerRoot,
       newRoot,
       newSize,
-    };
-
-    const signature = await account.signTypedData({
-      domain: buildDomain(this.ctx.chainId, this.opts.contract),
-      types: TYPES,
-      primaryType: "Upload",
-      message,
     });
 
-    const { outerRoot } = await postUpload(this.opts.hostUrl, bytes, {
+    const { outerRoot } = await postUpload(this.hostUrl, bytes, {
       client: this.clientAddress,
       fileRoot: fileRootHex,
       priorRoot: local.outerRoot,
@@ -104,7 +129,6 @@ export class JindoClient {
 
   async delete(fileRoot: Hex): Promise<Hex> {
     const target = fileRoot.toLowerCase() as Hex;
-    const account = privateKeyToAccount(this.opts.privateKey);
     const local = await this.assertCacheInSync();
 
     const all = this.cache.listFiles();
@@ -115,23 +139,16 @@ export class JindoClient {
     const newRoot = computeOuterRoot(remaining);
     const newSize = local.totalSize - BigInt(found.sizeBytes);
 
-    const message = {
+    const signature = await this.signIntent("Delete", {
       host: this.hostAddress,
       client: this.clientAddress,
       fileRoot: target,
       priorRoot: local.outerRoot,
       newRoot,
       newSize,
-    };
-
-    const signature = await account.signTypedData({
-      domain: buildDomain(this.ctx.chainId, this.opts.contract),
-      types: TYPES,
-      primaryType: "Delete",
-      message,
     });
 
-    const { txHash, outerRoot } = await postDelete(this.opts.hostUrl, {
+    const { txHash, outerRoot } = await postDelete(this.hostUrl, {
       client: this.clientAddress,
       fileRoot: target,
       priorRoot: local.outerRoot,
@@ -148,7 +165,7 @@ export class JindoClient {
 
   async recover(): Promise<{ files: FileRecord[]; outerRoot: Hex }> {
     const onChain = await readPair(this.ctx, this.hostAddress, this.clientAddress);
-    const remote = await fetchList(this.opts.hostUrl, this.clientAddress);
+    const remote = await fetchList(this.hostUrl, this.clientAddress);
 
     if (remote.outerRoot.toLowerCase() !== onChain.outerRoot.toLowerCase()) {
       throw new Error(

@@ -108,12 +108,13 @@ async function readPairOnChain() {
     functionName: "key",
     args: [HOST_ADDRESS, CLIENT_ADDRESS],
   })) as Hex;
-  return (await publicClient.readContract({
+  const [host, size, client, challengeIndex, root] = (await publicClient.readContract({
     address: contractAddress,
     abi: JINDO_ABI,
     functionName: "contracts",
     args: [key],
-  })) as readonly [Address, Address, Hex, bigint, bigint, bigint];
+  })) as readonly [Address, bigint, Address, bigint, Hex];
+  return { host, size, client, challengeIndex, root };
 }
 
 test("upload → list → delete → recover roundtrip", async () => {
@@ -128,13 +129,13 @@ test("upload → list → delete → recover roundtrip", async () => {
   expect(fileRoot1).toBe(computeFileRoot(bytes1));
 
   let onChain = await readPairOnChain();
-  expect(onChain[0]).toBe(HOST_ADDRESS);
-  expect(onChain[1]).toBe(CLIENT_ADDRESS);
+  expect(onChain.host).toBe(HOST_ADDRESS);
+  expect(onChain.client).toBe(CLIENT_ADDRESS);
   const expectedRootAfter1 = computeOuterRoot([
     { fileRoot: fileRoot1, sizeBytes: bytes1.byteLength, uploadedAt: 0 },
   ]);
-  expect(onChain[2].toLowerCase()).toBe(expectedRootAfter1.toLowerCase());
-  expect(onChain[3]).toBe(BigInt(bytes1.byteLength));
+  expect(onChain.root.toLowerCase()).toBe(expectedRootAfter1.toLowerCase());
+  expect(onChain.size).toBe(BigInt(bytes1.byteLength));
 
   // ── 2. upload second file ────────────────────────────────────────
   const bytes2 = new Uint8Array(1024);
@@ -145,8 +146,8 @@ test("upload → list → delete → recover roundtrip", async () => {
   expect(fileRoot2).not.toBe(fileRoot1);
 
   onChain = await readPairOnChain();
-  expect(onChain[3]).toBe(BigInt(bytes1.byteLength + bytes2.byteLength));
-  const rootAfterTwo = onChain[2];
+  expect(onChain.size).toBe(BigInt(bytes1.byteLength + bytes2.byteLength));
+  const rootAfterTwo = onChain.root;
   expect(rootAfterTwo.toLowerCase()).not.toBe(ZERO_ROOT);
 
   // ── 3. /list reflects both files ─────────────────────────────────
@@ -171,18 +172,18 @@ test("upload → list → delete → recover roundtrip", async () => {
   await jindo.delete(fileRoot1);
 
   onChain = await readPairOnChain();
-  expect(onChain[3]).toBe(BigInt(bytes2.byteLength));
+  expect(onChain.size).toBe(BigInt(bytes2.byteLength));
   const expectedRootAfterDelete = computeOuterRoot([
     { fileRoot: fileRoot2, sizeBytes: bytes2.byteLength, uploadedAt: 0 },
   ]);
-  expect(onChain[2].toLowerCase()).toBe(expectedRootAfterDelete.toLowerCase());
+  expect(onChain.root.toLowerCase()).toBe(expectedRootAfterDelete.toLowerCase());
 
   const listedAfter = await fetchList(hostUrl, CLIENT_ADDRESS);
   expect(listedAfter.files.length).toBe(1);
   expect(listedAfter.files[0]!.fileRoot.toLowerCase()).toBe(fileRoot2.toLowerCase());
 
   // ── 6. download is public ────────────────────────────────────────
-  const dl = await fetch(`${hostUrl}/download/${CLIENT_ADDRESS}/${fileRoot2}`);
+  const dl = await fetch(`${hostUrl}/download/${fileRoot2}`);
   expect(dl.status).toBe(200);
   const dlBytes = new Uint8Array(await dl.arrayBuffer());
   expect(dlBytes.byteLength).toBe(bytes2.byteLength);
@@ -264,15 +265,14 @@ test("host can answer the on-chain challenge with a valid proof", async () => {
     functionName: "key",
     args: [HOST_ADDRESS, proofClient],
   })) as Hex;
-  const pairBefore = (await publicClient.readContract({
+  const [, sizeBefore, , challengeBefore] = (await publicClient.readContract({
     address: contractAddress,
     abi: JINDO_ABI,
     functionName: "contracts",
     args: [pairKey],
-  })) as readonly [Address, Address, Hex, bigint, bigint, bigint];
-  const challengeBefore = pairBefore[4];
-  const challengeBlockBefore = pairBefore[5];
-  expect(pairBefore[3]).toBe(BigInt(a.byteLength + b.byteLength));
+  })) as readonly [Address, bigint, Address, bigint, Hex];
+  const blockBeforeProof = await publicClient.getBlockNumber();
+  expect(sizeBefore).toBe(BigInt(a.byteLength + b.byteLength));
   // 6 chunks → challengeIndex in [0, 6)
   expect(challengeBefore < 6n).toBe(true);
 
@@ -290,14 +290,9 @@ test("host can answer the on-chain challenge with a valid proof", async () => {
   );
   expect(result.challengeIndex).toBe(challengeBefore);
 
-  const pairAfter = (await publicClient.readContract({
-    address: contractAddress,
-    abi: JINDO_ABI,
-    functionName: "contracts",
-    args: [pairKey],
-  })) as readonly [Address, Address, Hex, bigint, bigint, bigint];
-  // Challenge rotated: block bumped, index may or may not change depending on entropy.
-  expect(pairAfter[5] > challengeBlockBefore).toBe(true);
+  // Challenge rotated: a new block was mined for the proof tx.
+  const blockAfterProof = await publicClient.getBlockNumber();
+  expect(blockAfterProof > blockBeforeProof).toBe(true);
 
   rmSync(proofCacheDir, { recursive: true, force: true });
 }, 30000);

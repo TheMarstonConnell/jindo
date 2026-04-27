@@ -16,11 +16,10 @@ export const JINDO_ABI = [
     inputs: [{ type: "bytes32" }],
     outputs: [
       { name: "host", type: "address" },
+      { name: "size", type: "uint64" },
       { name: "client", type: "address" },
+      { name: "challengeIndex", type: "uint64" },
       { name: "root", type: "bytes32" },
-      { name: "size", type: "uint256" },
-      { name: "challengeIndex", type: "uint256" },
-      { name: "challengeBlock", type: "uint256" },
     ],
   },
   {
