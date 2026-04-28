@@ -1,3 +1,5 @@
+
+![jindo logo](jindo.png)
 # jindo
 
 Jindo is a decentralized storage system that produces a cryptographically verifiable agreement between a data owner (the *client*) and a storage provider (the *host*). Every change to what a host is holding for a client gets signed by the client and committed on-chain, so neither side can later misrepresent what was stored.

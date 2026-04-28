@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   createPublicClient,
@@ -60,10 +60,10 @@ function saveSettings(s: Settings) {
 
 function formatBytes(n: number | bigint): string {
   const v = typeof n === "bigint" ? Number(n) : n;
-  if (v < 1024) return `${v} B`;
-  if (v < 1024 * 1024) return `${(v / 1024).toFixed(1)} KB`;
-  if (v < 1024 * 1024 * 1024) return `${(v / 1024 / 1024).toFixed(1)} MB`;
-  return `${(v / 1024 / 1024 / 1024).toFixed(2)} GB`;
+  if (v < 1024) return `${v} b`;
+  if (v < 1024 * 1024) return `${(v / 1024).toFixed(1)} kb`;
+  if (v < 1024 * 1024 * 1024) return `${(v / 1024 / 1024).toFixed(1)} mb`;
+  return `${(v / 1024 / 1024 / 1024).toFixed(2)} gb`;
 }
 
 function shortHex(h: string): string {
@@ -71,10 +71,26 @@ function shortHex(h: string): string {
   return `${h.slice(0, 10)}…${h.slice(-6)}`;
 }
 
+function chainName(id: number | null): string {
+  switch (id) {
+    case 1: return "ethereum";
+    case 11155111: return "sepolia";
+    case 8453: return "base";
+    case 84532: return "base sepolia";
+    case 10: return "optimism";
+    case 42161: return "arbitrum";
+    default: return id ? `chain ${id}` : "—";
+  }
+}
+
 interface BannerState {
   kind: "error" | "ok";
   text: string;
 }
+
+// Cream-stroked brand mark — sibling jindo-mark.svg in this folder. The
+// repo-root jindo.svg (black-stroked) is intentionally left untouched.
+import jindoMarkUrl from "./jindo-mark.svg";
 
 function App() {
   const [settings, setSettings] = useState<Settings>(loadSettings);
@@ -84,9 +100,9 @@ function App() {
   const [files, setFiles] = useState<FileRecord[]>([]);
   const [outerRoot, setOuterRoot] = useState<Hex | null>(null);
   const [totalSize, setTotalSize] = useState<bigint>(0n);
-  const [walletUsdc, setWalletUsdc] = useState<bigint>(0n); // base units (6 decimals)
-  const [contractAtto, setContractAtto] = useState<bigint>(0n); // atto-USDC
-  const [withdrawableAtto, setWithdrawableAtto] = useState<bigint>(0n); // atto-USDC
+  const [walletUsdc, setWalletUsdc] = useState<bigint>(0n);
+  const [contractAtto, setContractAtto] = useState<bigint>(0n);
+  const [withdrawableAtto, setWithdrawableAtto] = useState<bigint>(0n);
   const [usdcAddr, setUsdcAddr] = useState<Address | null>(null);
   const [usdcError, setUsdcError] = useState<string | null>(null);
   const [depositInput, setDepositInput] = useState("");
@@ -121,11 +137,11 @@ function App() {
   const connectWallet = useCallback(async () => {
     setBanner(null);
     if (!window.ethereum) {
-      setBanner({ kind: "error", text: "No injected wallet found (install MetaMask or similar)." });
+      setBanner({ kind: "error", text: "no injected wallet found (install metamask or similar)." });
       return;
     }
     if (!settings.hostUrl || !settings.contract || !settings.rpcUrl) {
-      setBanner({ kind: "error", text: "Set host URL, contract address, and RPC URL first." });
+      setBanner({ kind: "error", text: "set host url, contract address, and rpc url first." });
       return;
     }
 
@@ -154,14 +170,11 @@ function App() {
         openCache: memoryCacheFactory,
       });
 
-      // Pull current state from host so the local cache is in sync before any upload.
       try {
         await jindo.recover();
       } catch (e) {
-        // recover() throws if the chain has nothing yet — that's fine for a fresh pair.
         const msg = e instanceof Error ? e.message : String(e);
         if (!msg.includes("does not match chain")) {
-          // Surface unexpected errors but keep going if it's just an empty pair.
           console.warn("recover skipped:", msg);
         }
       }
@@ -171,9 +184,6 @@ function App() {
       setClient(jindo);
       await refresh(jindo);
 
-      // Pull USDC address + balances. If this fails the contract is most
-      // likely a pre-payment-aware deployment (no USDC() function); we keep
-      // the panel visible with the error so the user can act on it.
       setUsdcAddr(null);
       setUsdcError(null);
       try {
@@ -186,7 +196,7 @@ function App() {
         setUsdcError(msg);
       }
 
-      setBanner({ kind: "ok", text: `Connected as ${addr}` });
+      setBanner({ kind: "ok", text: `connected as ${addr}` });
     } catch (e) {
       setBanner({ kind: "error", text: e instanceof Error ? e.message : String(e) });
     } finally {
@@ -194,11 +204,26 @@ function App() {
     }
   }, [settings, refresh, refreshBalances]);
 
+  const disconnect = useCallback(() => {
+    setClient(null);
+    setAccount(null);
+    setChainId(null);
+    setFiles([]);
+    setOuterRoot(null);
+    setTotalSize(0n);
+    setWalletUsdc(0n);
+    setContractAtto(0n);
+    setWithdrawableAtto(0n);
+    setUsdcAddr(null);
+    setUsdcError(null);
+    setBanner(null);
+  }, []);
+
   const onDeposit = useCallback(async () => {
     if (!client) return;
     const amount = parseFloat(depositInput);
     if (!Number.isFinite(amount) || amount <= 0) {
-      setBanner({ kind: "error", text: "Enter a positive USDC amount." });
+      setBanner({ kind: "error", text: "enter a positive usdc amount." });
       return;
     }
     const baseAmount = BigInt(Math.round(amount * 1e6));
@@ -210,7 +235,7 @@ function App() {
       });
       await refreshBalances(client);
       setDepositInput("");
-      setBanner({ kind: "ok", text: `Deposited $${amount.toFixed(2)} USDC` });
+      setBanner({ kind: "ok", text: `deposited $${amount.toFixed(2)} usdc` });
     } catch (e) {
       setBanner({ kind: "error", text: e instanceof Error ? e.message : String(e) });
     } finally {
@@ -222,18 +247,15 @@ function App() {
     if (!client) return;
     const amount = parseFloat(withdrawInput);
     if (!Number.isFinite(amount) || amount <= 0) {
-      setBanner({ kind: "error", text: "Enter a positive USDC amount." });
+      setBanner({ kind: "error", text: "enter a positive usdc amount." });
       return;
     }
     const baseAmount = BigInt(Math.round(amount * 1e6));
-    // The contract holds back 30 days of storage fees as a reserve, so the
-    // wallet's view of "balance on contract" overstates what's actually
-    // pullable. Pre-check here to fail fast before MetaMask pops up.
     const withdrawableBase = withdrawableAtto / 1_000_000_000_000n;
     if (baseAmount > withdrawableBase) {
       setBanner({
         kind: "error",
-        text: `Only $${(Number(withdrawableBase) / 1e6).toFixed(6)} is withdrawable — the rest is reserved for 30 days of storage.`,
+        text: `only $${(Number(withdrawableBase) / 1e6).toFixed(6)} is withdrawable — the rest is reserved for 30 days of storage.`,
       });
       return;
     }
@@ -243,7 +265,7 @@ function App() {
       await client.withdrawUsdc(baseAmount);
       await refreshBalances(client);
       setWithdrawInput("");
-      setBanner({ kind: "ok", text: `Withdrew $${amount.toFixed(2)} USDC` });
+      setBanner({ kind: "ok", text: `withdrew $${amount.toFixed(2)} usdc` });
     } catch (e) {
       setBanner({ kind: "error", text: e instanceof Error ? e.message : String(e) });
     } finally {
@@ -263,7 +285,7 @@ function App() {
           const bytes = new Uint8Array(await f.arrayBuffer());
           const root = await client.upload(bytes);
           await refresh(client);
-          setBanner({ kind: "ok", text: `Uploaded ${f.name} → ${shortHex(root)}` });
+          setBanner({ kind: "ok", text: `uploaded ${f.name} → ${shortHex(root)}` });
         } catch (e) {
           setBanner({ kind: "error", text: e instanceof Error ? e.message : String(e) });
           break;
@@ -281,7 +303,7 @@ function App() {
       try {
         await client.delete(fileRoot);
         await refresh(client);
-        setBanner({ kind: "ok", text: `Deleted ${shortHex(fileRoot)}` });
+        setBanner({ kind: "ok", text: `deleted ${shortHex(fileRoot)}` });
       } catch (e) {
         setBanner({ kind: "error", text: e instanceof Error ? e.message : String(e) });
       } finally {
@@ -308,111 +330,158 @@ function App() {
     [onFiles],
   );
 
+  const connected = !!client && !!account;
+
+  const headerStatus = useMemo(
+    () => ({ left: connected ? chainName(chainId) : "not connected" }),
+    [connected, chainId],
+  );
+
   return (
-    <main>
-      <header>
-        <h1>Jindo demo</h1>
-        <p>Connect a wallet, point at a host, upload a file, and watch it land on-chain.</p>
-      </header>
+    <div className="frame">
+      <div className="shell">
+        <div className="bar">
+          <a className="brand" href="/" aria-label="jindo">
+            <img src={jindoMarkUrl} className="mark" alt="" />
+            <span className="word">jindo</span>
+          </a>
+          <span className="meta">
+            <span className={`dot${connected ? " live" : ""}`} />
+            {headerStatus.left}
+          </span>
+        </div>
 
-      {banner && <div className={`banner ${banner.kind}`}>{banner.text}</div>}
+        <div className="intro">
+          paste a host, connect a wallet, deposit usdc, upload files. each commit
+          is signed and anchored on-chain; hosts only earn when they re-prove the
+          data once per <strong>utc day</strong>.
+        </div>
 
-      <section className="panel">
-        <div>
-          <label>Host URL</label>
-          <input
-            type="url"
-            value={settings.hostUrl}
-            onChange={(e) => setSettings({ ...settings, hostUrl: e.target.value })}
-            placeholder="http://127.0.0.1:8787"
-            disabled={!!client}
-          />
-        </div>
-        <div>
-          <label>Contract address</label>
-          <input
-            type="text"
-            value={settings.contract}
-            onChange={(e) => setSettings({ ...settings, contract: e.target.value as Address })}
-            placeholder="0x…"
-            disabled={!!client}
-          />
-        </div>
-        <div>
-          <label>RPC URL (read-only)</label>
-          <input
-            type="url"
-            value={settings.rpcUrl}
-            onChange={(e) => setSettings({ ...settings, rpcUrl: e.target.value })}
-            placeholder="http://127.0.0.1:8545"
-            disabled={!!client}
-          />
-        </div>
-        <div className="row">
-          {!client ? (
-            <button onClick={connectWallet} disabled={busy === "connecting"}>
-              {busy === "connecting" ? "Connecting…" : "Connect wallet"}
-            </button>
-          ) : (
-            <button
-              className="secondary"
-              onClick={() => {
-                setClient(null);
-                setAccount(null);
-                setChainId(null);
-                setFiles([]);
-                setOuterRoot(null);
-                setTotalSize(0n);
-                setWalletUsdc(0n);
-                setContractAtto(0n);
-                setWithdrawableAtto(0n);
-                setUsdcAddr(null);
-                setUsdcError(null);
-                setBanner(null);
-              }}
-            >
-              Disconnect
-            </button>
-          )}
-        </div>
-      </section>
+        {banner && (
+          <div className="banner-bar">
+            <div className={`banner ${banner.kind}`}>{banner.text}</div>
+          </div>
+        )}
 
-      {client && account && (
-        <>
-          <section className="panel">
-            <div className="kv">
-              <div className="k">client</div>
-              <div className="v">{account}</div>
-              <div className="k">host</div>
-              <div className="v">{client.hostAddress}</div>
-              <div className="k">chain</div>
-              <div className="v">{chainId}</div>
-              <div className="k">outer root</div>
-              <div className="v">{outerRoot ?? "—"}</div>
-              <div className="k">total</div>
-              <div className="v">
-                {formatBytes(totalSize)} <span className="muted">({String(totalSize)} B)</span>
-              </div>
+        <div className={connected ? "grid" : ""}>
+        {/* connect */}
+        <section className="section area-connect">
+          <div className="section-head">
+            <div>
+              <h2>{connected ? "connection" : "connect"}</h2>
+              <p className="subtitle">
+                {connected
+                  ? "local cache is synced with the host."
+                  : "host url, contract, rpc — then connect a wallet to sign."}
+              </p>
             </div>
-          </section>
-
-          <section className="panel">
-            <div className="row" style={{ justifyContent: "space-between" }}>
-              <strong>USDC</strong>
-              <button
-                className="secondary"
-                onClick={() => client && refreshBalances(client)}
-                disabled={busy !== null || !usdcAddr}
-              >
-                Refresh
+            {connected && (
+              <button className="secondary small" onClick={disconnect}>
+                disconnect
               </button>
+            )}
+          </div>
+
+          {!connected ? (
+            <>
+              <div className="field">
+                <label>host url</label>
+                <input
+                  type="url"
+                  value={settings.hostUrl}
+                  onChange={(e) => setSettings({ ...settings, hostUrl: e.target.value })}
+                  placeholder="https://your-host"
+                  disabled={!!client}
+                />
+              </div>
+              <div className="field">
+                <label>contract address</label>
+                <input
+                  type="text"
+                  value={settings.contract}
+                  onChange={(e) =>
+                    setSettings({ ...settings, contract: e.target.value as Address })
+                  }
+                  placeholder="0x…"
+                  disabled={!!client}
+                />
+              </div>
+              <div className="field">
+                <label>rpc url</label>
+                <input
+                  type="url"
+                  value={settings.rpcUrl}
+                  onChange={(e) => setSettings({ ...settings, rpcUrl: e.target.value })}
+                  placeholder="https://sepolia.base.org"
+                  disabled={!!client}
+                />
+              </div>
+              <div className="row" style={{ marginTop: 18 }}>
+                <button onClick={connectWallet} disabled={busy === "connecting"}>
+                  {busy === "connecting" ? "connecting…" : "connect wallet"}
+                </button>
+              </div>
+            </>
+          ) : (
+            <table className="kv">
+              <tbody>
+                <tr>
+                  <th>client</th>
+                  <td className="preserve-case">{account}</td>
+                  <th>host</th>
+                  <td className="preserve-case">{client.hostAddress}</td>
+                </tr>
+                <tr>
+                  <th>chain</th>
+                  <td>
+                    {chainName(chainId)}{" "}
+                    <span className="muted">({chainId})</span>
+                  </td>
+                  <th>contract</th>
+                  <td className="preserve-case">{settings.contract}</td>
+                </tr>
+                <tr>
+                  <th>outer root</th>
+                  <td className="preserve-case">{outerRoot ?? "—"}</td>
+                  <th>stored</th>
+                  <td>
+                    {formatBytes(totalSize)}{" "}
+                    <span className="muted">({String(totalSize)} b)</span>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          )}
+        </section>
+
+        {/* ledger */}
+        {connected && (
+          <section className="section area-ledger">
+            <div className="section-head">
+              <div>
+                <h2>ledger</h2>
+                <p className="subtitle">
+                  funds held in atto-usdc on the contract. 30 days of the new total
+                  size is reserved while data is stored — anything beyond is
+                  withdrawable.
+                </p>
+              </div>
+              {usdcAddr && (
+                <button
+                  className="secondary small"
+                  onClick={() => client && refreshBalances(client)}
+                  disabled={busy !== null}
+                >
+                  refresh
+                </button>
+              )}
             </div>
+
             {!usdcAddr ? (
               <div className="banner error">
-                Couldn't read USDC address from the contract — the deployed Jindo at{" "}
+                couldn't read usdc address from the contract — the deployed jindo at{" "}
                 <code>{settings.contract}</code> probably predates the payment fields.
-                Redeploy with the current contract source (the deploy scripts now bake
-                USDC into the constructor) and reconnect.
+                redeploy with the current contract source and reconnect.
                 {usdcError && (
                   <>
                     <br />
@@ -422,32 +491,36 @@ function App() {
               </div>
             ) : (
               <>
-                <div className="kv">
-                  <div className="k">token</div>
-                  <div className="v">{usdcAddr}</div>
-                  <div className="k">wallet</div>
-                  <div className="v">
-                    ${(Number(walletUsdc) / 1e6).toFixed(6)}{" "}
-                    <span className="muted">({String(walletUsdc)} base)</span>
-                  </div>
-                  <div className="k">on contract</div>
-                  <div className="v">
-                    ${(Number(contractAtto / 1_000_000_000_000n) / 1e6).toFixed(6)}{" "}
-                    <span className="muted">({String(contractAtto)} atto)</span>
-                  </div>
-                  <div className="k">withdrawable</div>
-                  <div className="v">
-                    ${(Number(withdrawableAtto / 1_000_000_000_000n) / 1e6).toFixed(6)}{" "}
-                    <span className="muted">
-                      (rest is 30-day storage reserve)
-                    </span>
-                  </div>
-                </div>
-                <div className="row">
+                <table className="kv">
+                  <tbody>
+                    <tr>
+                      <th>token</th>
+                      <td className="preserve-case">{usdcAddr}</td>
+                      <th>wallet</th>
+                      <td>
+                        ${(Number(walletUsdc) / 1e6).toFixed(6)}{" "}
+                        <span className="muted">({String(walletUsdc)} base)</span>
+                      </td>
+                    </tr>
+                    <tr>
+                      <th>on contract</th>
+                      <td>
+                        ${(Number(contractAtto / 1_000_000_000_000n) / 1e6).toFixed(6)}{" "}
+                        <span className="muted">({String(contractAtto)} atto)</span>
+                      </td>
+                      <th>withdrawable</th>
+                      <td>
+                        ${(Number(withdrawableAtto / 1_000_000_000_000n) / 1e6).toFixed(6)}
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+
+                <div className="row" style={{ marginTop: 18 }}>
                   <input
                     type="text"
                     inputMode="decimal"
-                    placeholder="amount in USDC (e.g. 5.00)"
+                    placeholder="amount in usdc (e.g. 5.00)"
                     value={depositInput}
                     onChange={(e) => setDepositInput(e.target.value)}
                     disabled={busy !== null}
@@ -455,52 +528,66 @@ function App() {
                   />
                   <button onClick={onDeposit} disabled={busy !== null || !depositInput}>
                     {busy === "approving"
-                      ? "Approving…"
+                      ? "approving…"
                       : busy === "depositing"
-                      ? "Depositing…"
-                      : "Deposit"}
+                      ? "depositing…"
+                      : "deposit"}
                   </button>
                 </div>
-                <div className="row">
+                <div className="row" style={{ marginTop: 10 }}>
                   <input
                     type="text"
                     inputMode="decimal"
-                    placeholder="withdraw amount in USDC"
+                    placeholder="withdraw amount in usdc"
                     value={withdrawInput}
                     onChange={(e) => setWithdrawInput(e.target.value)}
                     disabled={busy !== null}
                     style={{ flex: 1, minWidth: 200 }}
                   />
                   <button
-                    className="secondary"
+                    className="secondary small"
                     onClick={() => {
                       const max = withdrawableAtto / 1_000_000_000_000n;
                       setWithdrawInput((Number(max) / 1e6).toString());
                     }}
                     disabled={busy !== null || withdrawableAtto === 0n}
-                    title="Fill in the maximum withdrawable amount"
+                    title="fill in the maximum withdrawable amount"
                   >
-                    Max
+                    max
                   </button>
                   <button
                     className="secondary"
                     onClick={onWithdraw}
                     disabled={busy !== null || !withdrawInput}
                   >
-                    {busy === "withdrawing" ? "Withdrawing…" : "Withdraw"}
+                    {busy === "withdrawing" ? "withdrawing…" : "withdraw"}
                   </button>
                 </div>
-                <div className="muted">
-                  Deposit takes one signature when the existing allowance covers
-                  the amount, otherwise two (approve, then deposit).
-                </div>
+                <p className="note">
+                  deposit takes one signature when allowance covers the amount,
+                  otherwise two — an erc-20 approve, then a deposit.
+                </p>
               </>
             )}
           </section>
+        )}
 
-          <section className="panel">
+        {/* upload */}
+        {connected && usdcAddr && (
+          <section className="section area-upload">
+            <div className="section-head">
+              <div>
+                <h2>upload</h2>
+                <p className="subtitle">
+                  each file is hashed into a 1 kib-chunked merkle tree, the new
+                  outer root is signed by your wallet, and the host submits the
+                  commit transaction.
+                </p>
+              </div>
+            </div>
+
             <div
-              className={`drop ${dragOver ? "over" : ""}`}
+              className={`drop${dragOver ? " over" : ""}`}
               onClick={() => fileInputRef.current?.click()}
               onDragOver={(e) => {
                 e.preventDefault();
@@ -511,7 +598,7 @@ function App() {
             >
               {busy?.startsWith("uploading")
                 ? busy
-                : "Drop a file here, or click to choose. The wallet will pop up to sign each upload."}
+                : "drop a file here, or click to choose. the wallet will pop up to sign."}
             </div>
             <input
               ref={fileInputRef}
@@ -524,19 +611,32 @@ function App() {
               }}
             />
           </section>
+        )}
 
-          <section className="panel">
-            <div className="row" style={{ justifyContent: "space-between" }}>
-              <strong>Files ({files.length})</strong>
+        {/* files */}
+        {connected && (
+          <section className="section area-files">
+            <div className="section-head">
+              <div>
+                <h2>
+                  files
+                  <span className="count">
+                    {files.length} {files.length === 1 ? "file" : "files"}
+                  </span>
+                </h2>
+                <p className="subtitle">
+                  current pair contents — synced from the host on connect.
+                </p>
+              </div>
               <button
-                className="secondary"
+                className="secondary small"
                 onClick={async () => {
                   if (!client) return;
                   setBusy("recovering");
                   try {
                     await client.recover();
                     await refresh(client);
-                    setBanner({ kind: "ok", text: "Synced from host." });
+                    setBanner({ kind: "ok", text: "synced from host." });
                   } catch (e) {
                     setBanner({
                       kind: "error",
@@ -548,37 +648,40 @@ function App() {
                 }}
                 disabled={busy !== null}
               >
-                {busy === "recovering" ? "Syncing…" : "Sync"}
+                {busy === "recovering" ? "syncing…" : "sync"}
               </button>
             </div>
+
             {files.length === 0 ? (
-              <div className="empty">No files yet.</div>
+              <div className="empty">— no files committed —</div>
             ) : (
               <div className="file-list">
                 {files.map((f) => (
                   <div key={f.fileRoot} className="file-row">
-                    <span className="root" title={f.fileRoot}>
+                    <span className="root preserve-case" title={f.fileRoot}>
                       {f.fileRoot}
                     </span>
                     <span className="size">{formatBytes(f.sizeBytes)}</span>
                     <a href={downloadUrl(f.fileRoot)} target="_blank" rel="noreferrer">
-                      <button className="secondary">Download</button>
+                      <button className="secondary small">download</button>
                     </a>
                     <button
-                      className="danger"
+                      className="danger small"
                       onClick={() => onDelete(f.fileRoot)}
                       disabled={busy !== null}
                     >
-                      Delete
+                      delete
                     </button>
                   </div>
                 ))}
               </div>
             )}
           </section>
-        </>
-      )}
-    </main>
+        )}
+        </div>
+
+      </div>
+    </div>
   );
 }
 
