@@ -4,6 +4,7 @@ import type { Address, Hex } from "viem";
 import { JindoClient } from "./lib/index.ts";
 import { startHost } from "./host/server.ts";
 import { prove } from "./host/prove.ts";
+import { withdrawAll } from "./host/withdraw.ts";
 import { loadClient, loadHost } from "./node/env.ts";
 import { sqliteCacheFactory } from "./node/sqlite-cache.ts";
 
@@ -79,6 +80,15 @@ program
     const jindo = await openClient(opts.host);
     const out = await jindo.recover();
     console.log(`recovered ${out.files.length} files\n  outer: ${out.outerRoot}`);
+  });
+
+program
+  .command("withdraw")
+  .description("(host) claim earnings from every client we store data for")
+  .action(async () => {
+    const results = await withdrawAll(loadHost());
+    const errors = results.filter((r) => r.status === "error");
+    if (errors.length > 0) process.exitCode = 1;
   });
 
 program

@@ -55,6 +55,10 @@ export interface OnChainPair {
   totalSize: bigint;
   challengeIndex: bigint;
   lastProof: bigint;
+  /// Atto-USDC accrued to the host on this pair, awaiting claim. The contract
+  /// floor-divides this by 1e12 (ATTO_PER_BASE) on claimEarnings; any sub-base
+  /// dust stays here for the next claim.
+  accrued: bigint;
 }
 
 /// Read the client's global on-contract balance pool, in atto-USDC.
@@ -78,6 +82,15 @@ export async function readRateBytePerDay(ctx: ChainContext): Promise<bigint> {
     abi: JINDO_ABI,
     functionName: "RATE_BYTE_DAY",
   })) as bigint;
+}
+
+/// Read the USDC token address baked into the contract at deploy time.
+export async function readUsdcAddress(ctx: ChainContext): Promise<Address> {
+  return (await ctx.publicClient.readContract({
+    address: ctx.contract,
+    abi: JINDO_ABI,
+    functionName: "USDC",
+  })) as Address;
 }
 
 /// Atto-USDC the client could pull right now without breaching the on-chain
@@ -107,7 +120,7 @@ export async function readPair(
     args: [host, client],
   })) as Hex;
 
-  const [h, size, c, challengeIndex, root, lastProof] = (await ctx.publicClient.readContract({
+  const [h, size, c, challengeIndex, root, lastProof, accrued] = (await ctx.publicClient.readContract({
     address: ctx.contract,
     abi: JINDO_ABI,
     functionName: "contracts",
@@ -121,7 +134,24 @@ export async function readPair(
     totalSize: size,
     challengeIndex,
     lastProof,
+    accrued,
   };
+}
+
+export async function submitClaimEarnings(
+  ctx: ChainContext,
+  client: Address,
+): Promise<Hex> {
+  const hash = await ctx.walletClient.writeContract({
+    account: ctx.walletClient.account!,
+    chain: null,
+    address: ctx.contract,
+    abi: JINDO_ABI,
+    functionName: "claimEarnings",
+    args: [client],
+  });
+  await ctx.publicClient.waitForTransactionReceipt({ hash });
+  return hash;
 }
 
 export async function submitCommitUpload(

@@ -36,9 +36,9 @@ interface Settings {
 }
 
 const DEFAULTS: Settings = {
-  hostUrl: "http://127.0.0.1:8787",
-  contract: "0x0000000000000000000000000000000000000000",
-  rpcUrl: "http://127.0.0.1:8545",
+  hostUrl: "https://jindo.marston.dev",
+  contract: "0x7915F17C3f5BD379e76688b6b3A935097f80F423",
+  rpcUrl: "https://sepolia.base.org",
 };
 
 const SETTINGS_KEY = "jindo:settings";
