@@ -1,47 +1,132 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.13;
 
+interface IERC20 {
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
+}
+
 contract Jindo {
     uint256 public constant CHUNK_SIZE = 1024;
 
-    /// @dev Packed into 3 storage slots:
+    /// @dev atto-USDC per byte per day. Internally everything is denominated in
+    /// atto-USDC (10^-18 USDC = 10^-12 base USDC units). Conversion to base USDC
+    /// only happens at deposit/withdraw/claim. With 6-decimal USDC base units,
+    /// $0.023/GB/month (= $0.000767/GB/day) ≈ 714_300 atto/byte/day:
+    ///   0.023 * 1e18 atto / 1_073_741_824 bytes / 30 days
+    uint64 public constant RATE_BYTE_DAY = 714_300;
+
+    /// One atto-USDC = 10^-18 USDC. One base USDC unit = 10^-6 USDC.
+    /// So `1 base unit = 10^12 atto`.
+    uint256 private constant ATTO_PER_BASE = 1e12;
+    uint256 private constant SECONDS_PER_DAY = 86_400;
+
+    /// @dev 4 storage slots per pair:
     ///   slot 0: host (20) | size (8) | _pad (4)
     ///   slot 1: client (20) | challengeIndex (8) | _pad (4)
     ///   slot 2: root (32)
-    /// Sizes are uint64 (~18 EB) which is more than enough for any practical file set.
-    /// challengeBlock is no longer stored — block.number is emitted in ChallengeRotated.
+    ///   slot 3: lastProof (8) | accrued (16) | _pad (8)
+    /// `lastProof` is the timestamp of the most recent successful commitProof.
+    /// It also gates the UTC-day cooldown: a proof reverts if `lastProof`
+    /// already lies in the current UTC calendar day. On the very first
+    /// commitUpload for a pair we seed it to block.timestamp, which keeps the
+    /// host's first payable proof in a different UTC day than the upload.
+    /// `accrued` carries sub-base-unit dust between proofs — once it crosses
+    /// 1 USDC base unit (10^12 atto) we flush to the host on the next proof.
     struct Contract {
         address host;
         uint64 size;
         address client;
         uint64 challengeIndex;
         bytes32 root;
+        uint64 lastProof;
+        uint128 accrued;
     }
+
+    /// Per-client deposit pool, atto-USDC. One deposit funds every pair the client
+    /// has with any host. _payProof() debits this on each successful proof.
+    ///
+    /// ⚠ cross-host griefing risk
+    /// ────────────────────────────
+    /// `balance` is global per-client and drained first-come-first-served by
+    /// whichever host calls `commitProof` first on a given UTC day. The contract
+    /// itself doesn't enforce that an incoming upload reserves enough pool for
+    /// every existing host the client already has; that's currently a host-side
+    /// check (see handleUpload in src/host/server.ts).
+    ///
+    /// Failure mode: an honest host A only checks `balance >= my_size × rate × 30`
+    /// at upload time. If client already has hosts B and C with their own
+    /// outstanding sizes, the *aggregate* coverage might fall below 30 days —
+    /// host A accepts the new upload, then B and C's `_payProof` calls race A
+    /// for the limited pool. Whoever proves first gets paid; whoever loses the
+    /// race accrues nothing and effectively stores the data for free until the
+    /// client re-funds.
+    ///
+    /// Mitigations to consider if/when the contract is opened to a multi-host
+    /// marketplace where hosts can't be assumed to cooperate:
+    ///   1. Have hosts check `balance >= sum(sizes of every pair this client
+    ///      has, queried via hostsOfClient) × rate × 30` at upload time.
+    ///   2. Enforce the check on-chain inside _verifyAndCommit so even buggy or
+    ///      adversarial hosts can't accept underfunded uploads. Adds ~2k gas
+    ///      per upload but is credibly neutral and works for any host code.
+    ///
+    /// For a single-operator deployment (one host, friendly clients) the
+    /// per-pair host check is sufficient and the griefing surface doesn't apply.
+    mapping(address => uint128) public balance;
+
+    IERC20 public immutable USDC;
 
     mapping(bytes32 => Contract) public contracts;
 
-    mapping(address => address[]) public clientsOfHost;
+    /// Hosts a client has live pairs with. Maintained on-chain because client
+    /// reserve checks (and any UI showing "where am I storing data") need to
+    /// enumerate them. The reverse direction (clients-of-host) is NOT tracked
+    /// on-chain — hosts already have authoritative lists in their local DB,
+    /// and skipping it saves ~44k gas (2 cold SSTOREs) per first upload.
     mapping(address => address[]) public hostsOfClient;
 
     function getHostsOfClient(address client) external view returns (address[] memory) {
         return hostsOfClient[client];
     }
 
-    function getClientsOfHost(address host) external view returns (address[] memory) {
-        return clientsOfHost[host];
+    /// Sum of `size` across every live pair this client has. Loops over
+    /// `hostsOfClient` rather than caching a running total — uploads are far
+    /// more frequent than reserve checks, so an SSTORE per upload would cost
+    /// more than it saves on the read side.
+    function getSizeOfClient(address client) public view returns (uint64) {
+        address[] storage hosts = hostsOfClient[client];
+        uint256 len = hosts.length;
+        uint64 size = 0;
+        for (uint256 i; i < len;) {
+            size += contracts[key(hosts[i], client)].size;
+            unchecked {
+                ++i;
+            }
+        }
+        return size;
     }
 
-    // 1-based index into the arrays above; 0 means "not present"
-    mapping(address => mapping(address => uint256)) private clientIndexOfHost;
-    mapping(address => mapping(address => uint256)) private hostIndexOfClient;
+    /// Atto-USDC the client could pull right now without breaching the 30-day
+    /// reserve check in withdraw(). Returns 0 when the pool has already fallen
+    /// below the reserve — proofs can drive it under as commitments accrue.
+    function getWithdrawableBalance(address client) public view returns (uint128) {
+        return _withdrawable(balance[client], client);
+    }
+
+    function _withdrawable(uint128 bal, address client) private view returns (uint128) {
+        uint128 reserve = uint128(getSizeOfClient(client)) * uint128(RATE_BYTE_DAY) * 30;
+        if (reserve >= bal) return 0;
+        return bal - reserve;
+    }
 
     bytes32 private constant DOMAIN_TYPEHASH =
         keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
     bytes32 private constant UPLOAD_TYPEHASH = keccak256(
-        "Upload(address host,address client,bytes32 fileRoot,bytes32 priorRoot,bytes32 newRoot,uint256 newSize)"
+        "Upload(address host,address client,bytes32 fileRoot,bytes32 priorRoot,bytes32 newRoot,uint64 newSize)"
     );
     bytes32 private constant DELETE_TYPEHASH = keccak256(
-        "Delete(address host,address client,bytes32 fileRoot,bytes32 priorRoot,bytes32 newRoot,uint256 newSize)"
+        "Delete(address host,address client,bytes32 fileRoot,bytes32 priorRoot,bytes32 newRoot,uint64 newSize)"
     );
 
     bytes32 public immutable DOMAIN_SEPARATOR;
@@ -58,7 +143,9 @@ contract Jindo {
     error BadSignature();
     error PriorRootRequiredZero();
     error PriorRootMismatch();
-    error SizeOverflow();
+    error InsufficientBalance();
+    error TransferFailed();
+    error CooldownActive();
 
     event ContractCreated(address indexed host, address indexed client, bytes32 root, uint256 size);
     event ContractUpdated(
@@ -71,8 +158,12 @@ contract Jindo {
     event ProofCommitted(
         address indexed host, address indexed client, uint256 challengeIndex, bytes32 fileRoot, uint256 chunkInFileIndex
     );
+    event Deposited(address indexed client, uint256 baseAmount, uint256 attoAmount);
+    event Withdrawn(address indexed client, uint256 baseAmount);
+    event EarningsClaimed(address indexed host, address indexed client, uint256 baseAmount);
 
-    constructor() {
+    constructor(IERC20 usdc) {
+        USDC = usdc;
         DOMAIN_SEPARATOR = keccak256(
             abi.encode(DOMAIN_TYPEHASH, keccak256(bytes("Jindo")), keccak256(bytes("1")), block.chainid, address(this))
         );
@@ -87,12 +178,67 @@ contract Jindo {
         }
     }
 
+    // ─────────────────────────────────────────────────────────────────────────────
+    //  Payment functions
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    /// Client pulls USDC into the contract; balance is held in atto units.
+    function deposit(uint256 baseAmount) external {
+        uint256 attoAmount = baseAmount * ATTO_PER_BASE;
+        balance[msg.sender] += uint128(attoAmount);
+        if (!USDC.transferFrom(msg.sender, address(this), baseAmount)) revert TransferFailed();
+        emit Deposited(msg.sender, baseAmount, attoAmount);
+    }
+
+    /// Client pulls unspent funds from their pool. The pool must keep at least
+    /// 30 days of fees for the client's current total stored bytes — otherwise
+    /// a client could fund a pair, withdraw the next block, and starve every
+    /// host they're committed to. Atto dust below 1 base unit stays.
+    function withdraw(uint256 baseAmount) external {
+        uint256 attoAmount = baseAmount * ATTO_PER_BASE;
+        uint128 bal = balance[msg.sender];
+        if (attoAmount > _withdrawable(bal, msg.sender)) revert InsufficientBalance();
+        balance[msg.sender] = bal - uint128(attoAmount);
+        if (!USDC.transfer(msg.sender, baseAmount)) revert TransferFailed();
+        emit Withdrawn(msg.sender, baseAmount);
+    }
+
+    /// Charge the client one day of storage and credit it to the host's
+    /// accrued balance. Pure bookkeeping — no USDC transfer happens here. The
+    /// host pulls whole base units out via claimEarnings() on their own schedule.
+    function _payProof(Contract storage c) private {
+        uint256 dailyFeeAtto = uint256(c.size) * uint256(RATE_BYTE_DAY);
+        uint128 pool = balance[c.client];
+        if (dailyFeeAtto > pool) dailyFeeAtto = pool;
+        if (dailyFeeAtto == 0) return;
+        balance[c.client] = pool - uint128(dailyFeeAtto);
+        c.accrued += uint128(dailyFeeAtto);
+    }
+
+    /// Host pulls accrued earnings from one pair. Floor-divides atto to base;
+    /// sub-base-unit dust stays on `accrued` for the next claim.
+    function claimEarnings(address client) external {
+        bytes32 k = key(msg.sender, client);
+        Contract storage c = contracts[k];
+        if (c.host != msg.sender) revert NotAuthorized();
+
+        uint256 baseAmount = uint256(c.accrued) / ATTO_PER_BASE;
+        if (baseAmount == 0) return;
+        c.accrued -= uint128(baseAmount * ATTO_PER_BASE);
+        if (!USDC.transfer(msg.sender, baseAmount)) revert TransferFailed();
+        emit EarningsClaimed(msg.sender, client, baseAmount);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    //  Storage commitments
+    // ─────────────────────────────────────────────────────────────────────────────
+
     function commitUpload(
         address client,
         bytes32 fileRoot,
         bytes32 priorRoot,
         bytes32 newRoot,
-        uint256 newSize,
+        uint64 newSize,
         bytes calldata signature
     ) external {
         _verifyAndCommit(UPLOAD_TYPEHASH, client, fileRoot, priorRoot, newRoot, newSize, signature);
@@ -103,25 +249,36 @@ contract Jindo {
         bytes32 fileRoot,
         bytes32 priorRoot,
         bytes32 newRoot,
-        uint256 newSize,
+        uint64 newSize,
         bytes calldata signature
     ) external {
         _verifyAndCommit(DELETE_TYPEHASH, client, fileRoot, priorRoot, newRoot, newSize, signature);
     }
 
+    /// Host ends the storage relationship. Flushes any whole-base-unit dust the
+    /// host has built up across prior proofs but does NOT charge the client for
+    /// the days since the last proof — those are forfeit (same rule as missed
+    /// proofs). Sub-base-unit dust on `accrued` is dropped when the pair is
+    /// deleted; the client keeps whatever is left in their global pool.
     function remove(address client) external {
         bytes32 k = key(msg.sender, client);
-        if (contracts[k].host != msg.sender) revert NotAuthorized();
+        Contract storage c = contracts[k];
+        if (c.host != msg.sender) revert NotAuthorized();
 
-        _removeFrom(clientsOfHost[msg.sender], clientIndexOfHost[msg.sender], client);
-        _removeFrom(hostsOfClient[client], hostIndexOfClient[client], msg.sender);
+        uint256 hostPayout = uint256(c.accrued) / ATTO_PER_BASE;
+        if (hostPayout > 0) {
+            if (!USDC.transfer(c.host, hostPayout)) revert TransferFailed();
+            emit EarningsClaimed(c.host, client, hostPayout);
+        }
+
+        _removeFrom(hostsOfClient[client], msg.sender);
 
         delete contracts[k];
         emit ContractRemoved(msg.sender, client);
     }
 
     /// @notice Host commits a data-availability proof for the current challenge.
-    /// @dev On success, rotates the challenge using the previous block's hash.
+    /// @dev On success, settles accrual and rotates the challenge.
     function commitProof(
         address client,
         uint256 cumulativeBytesBefore,
@@ -138,10 +295,12 @@ contract Jindo {
         uint256 cSize = c.size;
         if (cSize == 0) revert NoData();
 
-        uint256 challengeByte = uint256(c.challengeIndex) * CHUNK_SIZE;
-        if (cumulativeBytesBefore + fileSize > cSize) revert FileOverflow();
+        uint64 challengeIdx = c.challengeIndex;
+        uint256 challengeByte = uint256(challengeIdx) * CHUNK_SIZE;
+        uint256 fileEnd = cumulativeBytesBefore + fileSize;
+        if (fileEnd > cSize) revert FileOverflow();
         if (cumulativeBytesBefore > challengeByte) revert ChallengeBeforeFile();
-        if (challengeByte >= cumulativeBytesBefore + fileSize) revert ChallengeAfterFile();
+        if (challengeByte >= fileEnd) revert ChallengeAfterFile();
         if (chunkInFileIndex != (challengeByte - cumulativeBytesBefore) / CHUNK_SIZE) revert WrongChunkIndex();
 
         // The chunk at the last index of a file may be shorter than CHUNK_SIZE.
@@ -162,7 +321,18 @@ contract Jindo {
         bytes32 fileLeafHash = keccak256(abi.encode(chunkInFileIndex, chunkBytes));
         if (!_verifyMerkleProof(fileProof, fileRoot, fileLeafHash)) revert BadFileProof();
 
-        emit ProofCommitted(msg.sender, client, c.challengeIndex, fileRoot, chunkInFileIndex);
+        // UTC-day cooldown: at most one paid proof per calendar day. A host
+        // that misses a UTC day forfeits that day's revenue. Unix timestamps
+        // are seconds since 1970-01-01 00:00:00 UTC, so floor-dividing by
+        // SECONDS_PER_DAY gives the UTC day number — same number means the
+        // last proof landed somewhere in today's window.
+        if (uint256(c.lastProof) / SECONDS_PER_DAY == block.timestamp / SECONDS_PER_DAY) {
+            revert CooldownActive();
+        }
+        c.lastProof = uint64(block.timestamp);
+        _payProof(c);
+
+        emit ProofCommitted(msg.sender, client, challengeIdx, fileRoot, chunkInFileIndex);
         _rotateChallenge(k, c, msg.sender, client, uint64(cSize));
     }
 
@@ -172,11 +342,9 @@ contract Jindo {
         bytes32 fileRoot,
         bytes32 priorRoot,
         bytes32 newRoot,
-        uint256 newSize,
+        uint64 newSize,
         bytes calldata signature
     ) private {
-        if (newSize > type(uint64).max) revert SizeOverflow();
-
         bytes32 structHash = keccak256(abi.encode(typeHash, msg.sender, client, fileRoot, priorRoot, newRoot, newSize));
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
         if (_recover(digest, signature) != client) revert BadSignature();
@@ -188,28 +356,26 @@ contract Jindo {
             c.host = msg.sender;
             c.client = client;
             c.root = newRoot;
-            c.size = uint64(newSize);
+            c.size = newSize;
 
-            clientsOfHost[msg.sender].push(client);
-            clientIndexOfHost[msg.sender][client] = clientsOfHost[msg.sender].length;
             hostsOfClient[client].push(msg.sender);
-            hostIndexOfClient[client][msg.sender] = hostsOfClient[client].length;
 
             emit ContractCreated(msg.sender, client, newRoot, newSize);
         } else {
             if (c.root != priorRoot) revert PriorRootMismatch();
+            // No accrual to settle — payment is per-proof and uploads/deletes
+            // don't charge anything. Mid-day size changes apply on the next proof.
             bytes32 oldRoot = c.root;
             c.root = newRoot;
-            c.size = uint64(newSize);
+            c.size = newSize;
             emit ContractUpdated(msg.sender, client, oldRoot, newRoot, newSize);
         }
-        _rotateChallenge(k, c, msg.sender, client, uint64(newSize));
+        _rotateChallenge(k, c, msg.sender, client, newSize);
     }
 
     function _rotateChallenge(bytes32 k, Contract storage c, address host, address client, uint64 size) private {
         if (size == 0) {
             c.challengeIndex = 0;
-            // challengeBlock no longer stored
             return;
         }
         uint256 totalChunks;
@@ -263,15 +429,18 @@ contract Jindo {
         return ecrecover(digest, v, r, s);
     }
 
-    function _removeFrom(address[] storage arr, mapping(address => uint256) storage indexOf, address value) private {
-        uint256 idx = indexOf[value];
-        uint256 lastIdx = arr.length;
-        if (idx != lastIdx) {
-            address last = arr[lastIdx - 1];
-            arr[idx - 1] = last;
-            indexOf[last] = idx;
+    function _removeFrom(address[] storage arr, address value) private {
+        uint256 len = arr.length;
+        for (uint256 i; i < len;) {
+            if (arr[i] == value) {
+                uint256 lastIdx = len - 1;
+                if (i != lastIdx) arr[i] = arr[lastIdx];
+                arr.pop();
+                return;
+            }
+            unchecked {
+                ++i;
+            }
         }
-        arr.pop();
-        delete indexOf[value];
     }
 }

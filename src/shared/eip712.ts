@@ -17,7 +17,7 @@ export const TYPES = {
     { name: "fileRoot", type: "bytes32" },
     { name: "priorRoot", type: "bytes32" },
     { name: "newRoot", type: "bytes32" },
-    { name: "newSize", type: "uint256" },
+    { name: "newSize", type: "uint64" },
   ],
   Delete: [
     { name: "host", type: "address" },
@@ -25,7 +25,7 @@ export const TYPES = {
     { name: "fileRoot", type: "bytes32" },
     { name: "priorRoot", type: "bytes32" },
     { name: "newRoot", type: "bytes32" },
-    { name: "newSize", type: "uint256" },
+    { name: "newSize", type: "uint64" },
   ],
 } as const;
 

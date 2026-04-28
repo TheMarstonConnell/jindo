@@ -5,11 +5,39 @@ import { recoverIntentSigner } from "../shared/eip712.ts";
 import { fileRoot as computeFileRoot, outerRoot as computeOuterRoot } from "../shared/merkle.ts";
 import {
   buildChainContext,
+  readClientBalance,
   readPair,
+  readRateBytePerDay,
   submitCommitDelete,
   submitCommitUpload,
   type ChainContext,
 } from "../shared/chain.ts";
+
+const DAYS_PER_MONTH = 30n;
+
+// ── log helpers ──────────────────────────────────────────────────────────────
+
+function shortAddr(a: Address): string {
+  return `${a.slice(0, 6)}..${a.slice(-4)}`;
+}
+
+function shortHex(h: Hex): string {
+  return `${h.slice(0, 10)}..${h.slice(-4)}`;
+}
+
+function fmtUsdc(atto: bigint): string {
+  // atto-USDC → dollars. atto / 10^12 = base USDC; base / 10^6 = USD.
+  const base = atto / 1_000_000_000_000n;
+  return `$${(Number(base) / 1e6).toFixed(6)}`;
+}
+
+function fmtBytes(n: bigint | number): string {
+  const v = typeof n === "bigint" ? Number(n) : n;
+  if (v < 1024) return `${v} B`;
+  if (v < 1024 * 1024) return `${(v / 1024).toFixed(1)} KB`;
+  if (v < 1024 * 1024 * 1024) return `${(v / 1024 / 1024).toFixed(1)} MB`;
+  return `${(v / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
 import {
   blobIsLive,
   deleteFileRow,
@@ -23,7 +51,7 @@ import {
   writeState,
   type HostDb,
 } from "./db.ts";
-import { proveOnce } from "./prove.ts";
+import { proveOnce, ProofCooldownActive } from "./prove.ts";
 import type { HostEnv } from "../node/env.ts";
 
 const DEFAULT_PROVE_INTERVAL_MS = 12 * 60 * 60 * 1000; // 12 hours
@@ -82,6 +110,7 @@ async function handleUpload(
   req: Request,
   ctx: ChainContext,
   hdb: HostDb,
+  rateBytePerDay: bigint,
 ): Promise<Response> {
   let form: Awaited<ReturnType<Request["formData"]>>;
   try {
@@ -105,6 +134,7 @@ async function handleUpload(
   if (!isAddress(intent.client)) return jsonError(400, "intent.client invalid");
   const client = getAddress(intent.client);
   const newSize = BigInt(intent.newSize);
+  const tag = shortAddr(client);
 
   const signer = await recoverIntentSigner(
     ctx.chainId,
@@ -121,23 +151,31 @@ async function handleUpload(
     intent.signature,
   );
   if (signer.toLowerCase() !== client.toLowerCase()) {
+    console.log(`[upload] ${tag} signature mismatch — rejected (401)`);
     return jsonError(401, "signature does not match intent.client");
   }
+
+  console.log(
+    `[upload] ${tag} requested: fileRoot=${shortHex(intent.fileRoot)} newTotal=${fmtBytes(newSize)}`,
+  );
 
   return withLock(client, async () => {
     const state = await ensurePairState(ctx, hdb, client);
 
     if (state.outerRoot.toLowerCase() !== intent.priorRoot.toLowerCase()) {
+      console.log(`[upload] ${tag} priorRoot mismatch — rejected (409)`);
       return jsonError(409, "priorRoot mismatch", { currentRoot: state.outerRoot });
     }
 
     if (hasFile(hdb, client, intent.fileRoot)) {
+      console.log(`[upload] ${tag} file already exists — rejected (409)`);
       return jsonError(409, "file already in set", { currentRoot: state.outerRoot });
     }
 
     const bytes = new Uint8Array(await fileField.arrayBuffer());
     const computedFileRoot = computeFileRoot(bytes);
     if (computedFileRoot.toLowerCase() !== intent.fileRoot.toLowerCase()) {
+      console.log(`[upload] ${tag} fileRoot mismatch — rejected (400)`);
       return jsonError(400, "fileRoot does not match uploaded bytes");
     }
 
@@ -146,15 +184,50 @@ async function handleUpload(
       { fileRoot: computedFileRoot, sizeBytes: bytes.byteLength, uploadedAt: 0 },
     ]);
     if (expectedNewRoot.toLowerCase() !== intent.newRoot.toLowerCase()) {
+      console.log(`[upload] ${tag} newRoot mismatch — rejected (400)`);
       return jsonError(400, "newRoot does not match expected outer root");
     }
 
     const expectedNewSize = state.totalSize + BigInt(bytes.byteLength);
     if (expectedNewSize !== newSize) {
+      console.log(
+        `[upload] ${tag} newSize mismatch (got=${newSize} expected=${expectedNewSize}) — rejected (400)`,
+      );
       return jsonError(400, "newSize does not match expected size", {
         expected: expectedNewSize.toString(),
       });
     }
+
+    // Refuse the upload unless the client's on-contract balance can cover one
+    // month of storage at the new total size. Computed in atto-USDC:
+    //   required = newTotalSize × ratePerBytePerDay × 30
+    // Note this is a snapshot check. The pool is global per-client across all
+    // hosts, so other hosts could drain it later — but at this moment we know
+    // the client put up a month's worth of skin in the game for our pair.
+    const monthlyCostAtto = newSize * rateBytePerDay * DAYS_PER_MONTH;
+    const clientBalanceAtto = await readClientBalance(ctx, client);
+    const fileBytes = fmtBytes(bytes.byteLength);
+    const totalBytes = fmtBytes(newSize);
+    const balanceFmt = fmtUsdc(clientBalanceAtto);
+    const requiredFmt = fmtUsdc(monthlyCostAtto);
+
+    if (clientBalanceAtto < monthlyCostAtto) {
+      const shortAtto = monthlyCostAtto - clientBalanceAtto;
+      console.log(
+        `[upload] ${tag} balance=${balanceFmt} required=${requiredFmt} (30d × ${totalBytes}) ` +
+          `short ${fmtUsdc(shortAtto)} — REJECTED (402)`,
+      );
+      return jsonError(402, "client balance insufficient for one month of storage", {
+        requiredAtto: monthlyCostAtto.toString(),
+        availableAtto: clientBalanceAtto.toString(),
+        newTotalBytes: newSize.toString(),
+      });
+    }
+
+    console.log(
+      `[upload] ${tag} balance=${balanceFmt} required=${requiredFmt} (30d × ${totalBytes}) ` +
+        `— allowed; committing ${fileBytes} (file=${shortHex(intent.fileRoot)})`,
+    );
 
     const blobPath = `${hdb.blobsDir}/${intent.fileRoot}`;
     const blobExistedBefore = existsSync(blobPath);
@@ -171,8 +244,10 @@ async function handleUpload(
         intent.signature,
       );
     } catch (e) {
+      console.error(`[upload] ${tag} chain submission failed:`, e);
       return jsonError(502, "chain submission failed", { detail: String(e) });
     }
+    console.log(`[upload] ${tag} chain ok: tx=${txHash}`);
 
     try {
       await Bun.write(blobPath, bytes);
@@ -192,12 +267,19 @@ async function handleUpload(
       try {
         if (!blobExistedBefore && existsSync(blobPath)) unlinkSync(blobPath);
       } catch {}
+      console.error(
+        `[upload] ${tag} local persist FAILED after chain tx ${txHash}:`,
+        e,
+      );
       return jsonError(500, "chain succeeded but local persistence failed", {
         detail: String(e),
         txHash,
       });
     }
 
+    console.log(
+      `[upload] ${tag} stored ${fileBytes} (file=${shortHex(intent.fileRoot)}); pair total=${totalBytes}`,
+    );
     return withCors(Response.json({ txHash, outerRoot: intent.newRoot }));
   });
 }
@@ -340,10 +422,14 @@ async function proveAllClients(ctx: ChainContext, hdb: HostDb, env: HostEnv): Pr
         `[prove-all] ${s.client}: ok challengeIndex=${result.challengeIndex} fileRoot=${result.fileRoot} tx=${result.txHash}`,
       );
     } catch (e) {
-      console.error(
-        `[prove-all] ${s.client}: failed —`,
-        e instanceof Error ? e.message : String(e),
-      );
+      if (e instanceof ProofCooldownActive) {
+        console.log(`[prove-all] ${s.client}: cooldown — already proved this UTC day, skipping`);
+      } else {
+        console.error(
+          `[prove-all] ${s.client}: failed —`,
+          e instanceof Error ? e.message : String(e),
+        );
+      }
     }
   }
   console.log(`[prove-all] sweep done`);
@@ -358,6 +444,10 @@ export async function startHost(env: HostEnv): Promise<{ stop: () => void; url: 
 
   const hdb = openHostDb(env.dataDir);
 
+  // Cache the contract's RATE_BYTE_DAY constant. It's a `constant` in Solidity
+  // so it never changes for the lifetime of this deployment.
+  const rateBytePerDay = await readRateBytePerDay(ctx);
+
   const corsPreflight = () => withCors(new Response(null, { status: 204 }));
 
   const server = Bun.serve({
@@ -371,7 +461,10 @@ export async function startHost(env: HostEnv): Promise<{ stop: () => void; url: 
           ),
         OPTIONS: corsPreflight,
       },
-      "/upload": { POST: (req) => handleUpload(req, ctx, hdb), OPTIONS: corsPreflight },
+      "/upload": {
+        POST: (req) => handleUpload(req, ctx, hdb, rateBytePerDay),
+        OPTIONS: corsPreflight,
+      },
       "/delete": { POST: (req) => handleDelete(req, ctx, hdb), OPTIONS: corsPreflight },
       "/clients": {
         GET: () =>

@@ -54,6 +54,45 @@ export interface OnChainPair {
   outerRoot: Hex;
   totalSize: bigint;
   challengeIndex: bigint;
+  lastProof: bigint;
+}
+
+/// Read the client's global on-contract balance pool, in atto-USDC.
+export async function readClientBalance(
+  ctx: ChainContext,
+  client: Address,
+): Promise<bigint> {
+  return (await ctx.publicClient.readContract({
+    address: ctx.contract,
+    abi: JINDO_ABI,
+    functionName: "balance",
+    args: [client],
+  })) as bigint;
+}
+
+/// Read RATE_BYTE_DAY (atto-USDC per byte per day) from the contract. It's a
+/// `constant` so this is safe to cache for the lifetime of a process.
+export async function readRateBytePerDay(ctx: ChainContext): Promise<bigint> {
+  return (await ctx.publicClient.readContract({
+    address: ctx.contract,
+    abi: JINDO_ABI,
+    functionName: "RATE_BYTE_DAY",
+  })) as bigint;
+}
+
+/// Atto-USDC the client could pull right now without breaching the on-chain
+/// 30-day reserve check. Always ≤ readClientBalance() — drops to 0 if proofs
+/// have already drained the pool below the reserve.
+export async function readWithdrawableBalance(
+  ctx: ChainContext,
+  client: Address,
+): Promise<bigint> {
+  return (await ctx.publicClient.readContract({
+    address: ctx.contract,
+    abi: JINDO_ABI,
+    functionName: "getWithdrawableBalance",
+    args: [client],
+  })) as bigint;
 }
 
 export async function readPair(
@@ -68,12 +107,12 @@ export async function readPair(
     args: [host, client],
   })) as Hex;
 
-  const [h, size, c, challengeIndex, root] = (await ctx.publicClient.readContract({
+  const [h, size, c, challengeIndex, root, lastProof] = (await ctx.publicClient.readContract({
     address: ctx.contract,
     abi: JINDO_ABI,
     functionName: "contracts",
     args: [key],
-  })) as readonly [Address, bigint, Address, bigint, Hex];
+  })) as readonly [Address, bigint, Address, bigint, Hex, bigint, bigint];
 
   return {
     host: h,
@@ -81,6 +120,7 @@ export async function readPair(
     outerRoot: root,
     totalSize: size,
     challengeIndex,
+    lastProof,
   };
 }
 

@@ -2,13 +2,14 @@
 # Shared deploy helper. Don't run directly — use deploy-sepolia.sh / deploy-mainnet.sh.
 set -euo pipefail
 
-if [[ $# -lt 2 ]]; then
-  echo "usage: $0 <chain-id> <rpc-url>" >&2
+if [[ $# -lt 3 ]]; then
+  echo "usage: $0 <chain-id> <rpc-url> <default-usdc-address>" >&2
   exit 1
 fi
 
 CHAIN_ID="$1"
 RPC="$2"
+DEFAULT_USDC="$3"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -26,6 +27,10 @@ set +a
 
 : "${DEPLOYER_PRIVATE_KEY:?DEPLOYER_PRIVATE_KEY not set in .env}"
 
+# JINDO_USDC defaults to the network's canonical USDC if the user didn't override it.
+# The forge script reads this via vm.envAddress("JINDO_USDC").
+export JINDO_USDC="${JINDO_USDC:-$DEFAULT_USDC}"
+
 DEPLOYER="$(cast wallet address "$DEPLOYER_PRIVATE_KEY")"
 BALANCE_WEI="$(cast balance "$DEPLOYER" --rpc-url "$RPC")"
 BALANCE_ETH="$(cast --to-unit "$BALANCE_WEI" ether)"
@@ -35,6 +40,7 @@ echo " chain id    : $CHAIN_ID"
 echo " rpc         : $RPC"
 echo " deployer    : $DEPLOYER"
 echo " balance     : $BALANCE_ETH ETH"
+echo " usdc        : $JINDO_USDC"
 echo "════════════════════════════════════════════════════════════"
 
 if [[ "$BALANCE_WEI" == "0" ]]; then
@@ -74,3 +80,6 @@ echo ""
 echo "Update .env:"
 echo "  JINDO_CONTRACT=$ADDR"
 echo "  JINDO_RPC_URL=$RPC"
+echo ""
+echo "USDC address baked into the contract: $JINDO_USDC"
+echo "(verify on-chain via:  cast call $ADDR 'USDC()(address)' --rpc-url $RPC )"

@@ -84,6 +84,13 @@ function App() {
   const [files, setFiles] = useState<FileRecord[]>([]);
   const [outerRoot, setOuterRoot] = useState<Hex | null>(null);
   const [totalSize, setTotalSize] = useState<bigint>(0n);
+  const [walletUsdc, setWalletUsdc] = useState<bigint>(0n); // base units (6 decimals)
+  const [contractAtto, setContractAtto] = useState<bigint>(0n); // atto-USDC
+  const [withdrawableAtto, setWithdrawableAtto] = useState<bigint>(0n); // atto-USDC
+  const [usdcAddr, setUsdcAddr] = useState<Address | null>(null);
+  const [usdcError, setUsdcError] = useState<string | null>(null);
+  const [depositInput, setDepositInput] = useState("");
+  const [withdrawInput, setWithdrawInput] = useState("");
   const [banner, setBanner] = useState<BannerState | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState(false);
@@ -98,6 +105,17 @@ function App() {
     setFiles(out.files);
     setOuterRoot(out.state.outerRoot);
     setTotalSize(out.state.totalSize);
+  }, []);
+
+  const refreshBalances = useCallback(async (jindo: JindoClient) => {
+    const [wallet, contract, withdrawable] = await Promise.all([
+      jindo.walletUsdcBalance(),
+      jindo.contractUsdcBalance(),
+      jindo.withdrawableUsdc(),
+    ]);
+    setWalletUsdc(wallet);
+    setContractAtto(contract);
+    setWithdrawableAtto(withdrawable);
   }, []);
 
   const connectWallet = useCallback(async () => {
@@ -152,13 +170,86 @@ function App() {
       setChainId(ctx.chainId);
       setClient(jindo);
       await refresh(jindo);
+
+      // Pull USDC address + balances. If this fails the contract is most
+      // likely a pre-payment-aware deployment (no USDC() function); we keep
+      // the panel visible with the error so the user can act on it.
+      setUsdcAddr(null);
+      setUsdcError(null);
+      try {
+        const usdc = await jindo.usdcAddress();
+        setUsdcAddr(usdc);
+        await refreshBalances(jindo);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        console.warn("usdc balance read skipped:", e);
+        setUsdcError(msg);
+      }
+
       setBanner({ kind: "ok", text: `Connected as ${addr}` });
     } catch (e) {
       setBanner({ kind: "error", text: e instanceof Error ? e.message : String(e) });
     } finally {
       setBusy(null);
     }
-  }, [settings, refresh]);
+  }, [settings, refresh, refreshBalances]);
+
+  const onDeposit = useCallback(async () => {
+    if (!client) return;
+    const amount = parseFloat(depositInput);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      setBanner({ kind: "error", text: "Enter a positive USDC amount." });
+      return;
+    }
+    const baseAmount = BigInt(Math.round(amount * 1e6));
+    setBanner(null);
+    setBusy("depositing");
+    try {
+      await client.depositUsdc(baseAmount, {
+        onStage: (stage) => setBusy(stage === "approve" ? "approving" : "depositing"),
+      });
+      await refreshBalances(client);
+      setDepositInput("");
+      setBanner({ kind: "ok", text: `Deposited $${amount.toFixed(2)} USDC` });
+    } catch (e) {
+      setBanner({ kind: "error", text: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setBusy(null);
+    }
+  }, [client, depositInput, refreshBalances]);
+
+  const onWithdraw = useCallback(async () => {
+    if (!client) return;
+    const amount = parseFloat(withdrawInput);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      setBanner({ kind: "error", text: "Enter a positive USDC amount." });
+      return;
+    }
+    const baseAmount = BigInt(Math.round(amount * 1e6));
+    // The contract holds back 30 days of storage fees as a reserve, so the
+    // wallet's view of "balance on contract" overstates what's actually
+    // pullable. Pre-check here to fail fast before MetaMask pops up.
+    const withdrawableBase = withdrawableAtto / 1_000_000_000_000n;
+    if (baseAmount > withdrawableBase) {
+      setBanner({
+        kind: "error",
+        text: `Only $${(Number(withdrawableBase) / 1e6).toFixed(6)} is withdrawable — the rest is reserved for 30 days of storage.`,
+      });
+      return;
+    }
+    setBanner(null);
+    setBusy("withdrawing");
+    try {
+      await client.withdrawUsdc(baseAmount);
+      await refreshBalances(client);
+      setWithdrawInput("");
+      setBanner({ kind: "ok", text: `Withdrew $${amount.toFixed(2)} USDC` });
+    } catch (e) {
+      setBanner({ kind: "error", text: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setBusy(null);
+    }
+  }, [client, withdrawInput, withdrawableAtto, refreshBalances]);
 
   const onFiles = useCallback(
     async (fileList: FileList | File[]) => {
@@ -272,6 +363,11 @@ function App() {
                 setFiles([]);
                 setOuterRoot(null);
                 setTotalSize(0n);
+                setWalletUsdc(0n);
+                setContractAtto(0n);
+                setWithdrawableAtto(0n);
+                setUsdcAddr(null);
+                setUsdcError(null);
                 setBanner(null);
               }}
             >
@@ -298,6 +394,108 @@ function App() {
                 {formatBytes(totalSize)} <span className="muted">({String(totalSize)} B)</span>
               </div>
             </div>
+          </section>
+
+          <section className="panel">
+            <div className="row" style={{ justifyContent: "space-between" }}>
+              <strong>USDC</strong>
+              <button
+                className="secondary"
+                onClick={() => client && refreshBalances(client)}
+                disabled={busy !== null || !usdcAddr}
+              >
+                Refresh
+              </button>
+            </div>
+            {!usdcAddr ? (
+              <div className="banner error">
+                Couldn't read USDC address from the contract — the deployed Jindo at{" "}
+                <code>{settings.contract}</code> probably predates the payment fields.
+                Redeploy with the current contract source (the deploy scripts now bake
+                USDC into the constructor) and reconnect.
+                {usdcError && (
+                  <>
+                    <br />
+                    <span className="muted">details: {usdcError}</span>
+                  </>
+                )}
+              </div>
+            ) : (
+              <>
+                <div className="kv">
+                  <div className="k">token</div>
+                  <div className="v">{usdcAddr}</div>
+                  <div className="k">wallet</div>
+                  <div className="v">
+                    ${(Number(walletUsdc) / 1e6).toFixed(6)}{" "}
+                    <span className="muted">({String(walletUsdc)} base)</span>
+                  </div>
+                  <div className="k">on contract</div>
+                  <div className="v">
+                    ${(Number(contractAtto / 1_000_000_000_000n) / 1e6).toFixed(6)}{" "}
+                    <span className="muted">({String(contractAtto)} atto)</span>
+                  </div>
+                  <div className="k">withdrawable</div>
+                  <div className="v">
+                    ${(Number(withdrawableAtto / 1_000_000_000_000n) / 1e6).toFixed(6)}{" "}
+                    <span className="muted">
+                      (rest is 30-day storage reserve)
+                    </span>
+                  </div>
+                </div>
+                <div className="row">
+                  <input
+                    type="text"
+                    inputMode="decimal"
+                    placeholder="amount in USDC (e.g. 5.00)"
+                    value={depositInput}
+                    onChange={(e) => setDepositInput(e.target.value)}
+                    disabled={busy !== null}
+                    style={{ flex: 1, minWidth: 200 }}
+                  />
+                  <button onClick={onDeposit} disabled={busy !== null || !depositInput}>
+                    {busy === "approving"
+                      ? "Approving…"
+                      : busy === "depositing"
+                      ? "Depositing…"
+                      : "Deposit"}
+                  </button>
+                </div>
+                <div className="row">
+                  <input
+                    type="text"
+                    inputMode="decimal"
+                    placeholder="withdraw amount in USDC"
+                    value={withdrawInput}
+                    onChange={(e) => setWithdrawInput(e.target.value)}
+                    disabled={busy !== null}
+                    style={{ flex: 1, minWidth: 200 }}
+                  />
+                  <button
+                    className="secondary"
+                    onClick={() => {
+                      const max = withdrawableAtto / 1_000_000_000_000n;
+                      setWithdrawInput((Number(max) / 1e6).toString());
+                    }}
+                    disabled={busy !== null || withdrawableAtto === 0n}
+                    title="Fill in the maximum withdrawable amount"
+                  >
+                    Max
+                  </button>
+                  <button
+                    className="secondary"
+                    onClick={onWithdraw}
+                    disabled={busy !== null || !withdrawInput}
+                  >
+                    {busy === "withdrawing" ? "Withdrawing…" : "Withdraw"}
+                  </button>
+                </div>
+                <div className="muted">
+                  Deposit takes one signature when the existing allowance covers
+                  the amount, otherwise two (approve, then deposit).
+                </div>
+              </>
+            )}
           </section>
 
           <section className="panel">

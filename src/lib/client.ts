@@ -2,9 +2,40 @@ import type { Address, Hex } from "viem";
 import { buildDomain, TYPES } from "../shared/eip712.ts";
 import { fileRoot as computeFileRoot, outerRoot as computeOuterRoot } from "../shared/merkle.ts";
 import { buildChainContext, readPair, type ChainContext } from "../shared/chain.ts";
+import { JINDO_ABI } from "../shared/abi.ts";
 import type { FileRecord, PairState } from "../shared/types.ts";
 import type { CacheFactory, CacheStore } from "./cache.ts";
 import { fetchHostAddress, fetchList, postDelete, postUpload } from "./host-client.ts";
+
+const ERC20_ABI = [
+  {
+    type: "function",
+    name: "balanceOf",
+    stateMutability: "view",
+    inputs: [{ name: "account", type: "address" }],
+    outputs: [{ type: "uint256" }],
+  },
+  {
+    type: "function",
+    name: "allowance",
+    stateMutability: "view",
+    inputs: [
+      { name: "owner", type: "address" },
+      { name: "spender", type: "address" },
+    ],
+    outputs: [{ type: "uint256" }],
+  },
+  {
+    type: "function",
+    name: "approve",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "spender", type: "address" },
+      { name: "amount", type: "uint256" },
+    ],
+    outputs: [{ type: "bool" }],
+  },
+] as const;
 
 export interface JindoClientOptions {
   rpcUrl: string;
@@ -191,5 +222,121 @@ export class JindoClient {
     });
 
     return { files: remote.files, outerRoot: onChain.outerRoot };
+  }
+
+  // ── USDC payment helpers ───────────────────────────────────────────────────
+
+  private cachedUsdc: Address | null = null;
+
+  /// Read the USDC token address the Jindo contract is configured for. Cached.
+  async usdcAddress(): Promise<Address> {
+    if (this.cachedUsdc) return this.cachedUsdc;
+    const addr = (await this.ctx.publicClient.readContract({
+      address: this.ctx.contract,
+      abi: JINDO_ABI,
+      functionName: "USDC",
+    })) as Address;
+    this.cachedUsdc = addr;
+    return addr;
+  }
+
+  /// USDC the connected wallet holds (base units, 6 decimals).
+  async walletUsdcBalance(): Promise<bigint> {
+    const usdc = await this.usdcAddress();
+    return (await this.ctx.publicClient.readContract({
+      address: usdc,
+      abi: ERC20_ABI,
+      functionName: "balanceOf",
+      args: [this.clientAddress],
+    })) as bigint;
+  }
+
+  /// The client's deposited balance held by the Jindo contract (atto-USDC).
+  async contractUsdcBalance(): Promise<bigint> {
+    return (await this.ctx.publicClient.readContract({
+      address: this.ctx.contract,
+      abi: JINDO_ABI,
+      functionName: "balance",
+      args: [this.clientAddress],
+    })) as bigint;
+  }
+
+  /// Atto-USDC the connected wallet could withdraw right now. Equals
+  /// contractUsdcBalance() minus the 30-day storage reserve the contract
+  /// holds back across all of this client's live pairs.
+  async withdrawableUsdc(): Promise<bigint> {
+    return (await this.ctx.publicClient.readContract({
+      address: this.ctx.contract,
+      abi: JINDO_ABI,
+      functionName: "getWithdrawableBalance",
+      args: [this.clientAddress],
+    })) as bigint;
+  }
+
+  /// Read the current ERC-20 allowance the wallet has granted to the Jindo contract.
+  async usdcAllowance(): Promise<bigint> {
+    const usdc = await this.usdcAddress();
+    return (await this.ctx.publicClient.readContract({
+      address: usdc,
+      abi: ERC20_ABI,
+      functionName: "allowance",
+      args: [this.clientAddress, this.ctx.contract],
+    })) as bigint;
+  }
+
+  /// Deposit USDC. If the wallet has already granted enough allowance to the
+  /// Jindo contract, the approve step is skipped — so most subsequent deposits
+  /// only prompt MetaMask once. The approveHash is `null` when skipped.
+  async depositUsdc(
+    baseAmount: bigint,
+    opts?: { onStage?: (stage: "approve" | "deposit") => void },
+  ): Promise<{ approveHash: Hex | null; depositHash: Hex }> {
+    const account = this.ctx.walletClient.account;
+    if (!account) throw new Error("walletClient missing account");
+    const usdc = await this.usdcAddress();
+
+    let approveHash: Hex | null = null;
+    const currentAllowance = await this.usdcAllowance();
+    if (currentAllowance < baseAmount) {
+      opts?.onStage?.("approve");
+      approveHash = await this.ctx.walletClient.writeContract({
+        account,
+        chain: null,
+        address: usdc,
+        abi: ERC20_ABI,
+        functionName: "approve",
+        args: [this.ctx.contract, baseAmount],
+      });
+      await this.ctx.publicClient.waitForTransactionReceipt({ hash: approveHash });
+    }
+
+    opts?.onStage?.("deposit");
+    const depositHash = await this.ctx.walletClient.writeContract({
+      account,
+      chain: null,
+      address: this.ctx.contract,
+      abi: JINDO_ABI,
+      functionName: "deposit",
+      args: [baseAmount],
+    });
+    await this.ctx.publicClient.waitForTransactionReceipt({ hash: depositHash });
+
+    return { approveHash, depositHash };
+  }
+
+  /// Pull `baseAmount` USDC out of the contract pool back to the connected wallet.
+  async withdrawUsdc(baseAmount: bigint): Promise<Hex> {
+    const account = this.ctx.walletClient.account;
+    if (!account) throw new Error("walletClient missing account");
+    const hash = await this.ctx.walletClient.writeContract({
+      account,
+      chain: null,
+      address: this.ctx.contract,
+      abi: JINDO_ABI,
+      functionName: "withdraw",
+      args: [baseAmount],
+    });
+    await this.ctx.publicClient.waitForTransactionReceipt({ hash });
+    return hash;
   }
 }

@@ -8,6 +8,10 @@ export const ZERO_ROOT: Hex = `0x${"0".repeat(64)}`;
 // are the same constant, so chunk indices line up across both layers.
 export const CHUNK_SIZE = 1024;
 
+// Mirrors Jindo.SECONDS_PER_DAY. Used to predict the chain's UTC-day cooldown
+// before submitting a proof so the host can skip pairs already proved today.
+export const SECONDS_PER_DAY = 86_400n;
+
 export interface FileRecord {
   fileRoot: Hex;
   sizeBytes: number;

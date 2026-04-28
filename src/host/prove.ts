@@ -7,7 +7,7 @@ import {
   type ChainContext,
 } from "../shared/chain.ts";
 import { fileMerkleProof, locateOffset, outerMerkleProof } from "../shared/merkle.ts";
-import { CHUNK_SIZE } from "../shared/types.ts";
+import { CHUNK_SIZE, SECONDS_PER_DAY } from "../shared/types.ts";
 import type { HostEnv } from "../node/env.ts";
 import { listFiles, openHostDb, type HostDb } from "./db.ts";
 
@@ -16,6 +16,16 @@ export interface ProveResult {
   challengeIndex: bigint;
   fileRoot: Hex;
   chunkInFileIndex: number;
+}
+
+/// Thrown when the contract's UTC-day cooldown is still active for a pair.
+/// Surfaces as a soft skip in the sweep so we don't burn a tx that would
+/// revert with CooldownActive on chain.
+export class ProofCooldownActive extends Error {
+  constructor() {
+    super("UTC-day cooldown active for this pair");
+    this.name = "ProofCooldownActive";
+  }
 }
 
 export async function proveOnce(
@@ -27,6 +37,14 @@ export async function proveOnce(
   const checked = getAddress(client);
   const onChain = await readPair(ctx, ctx.account, checked);
   if (onChain.totalSize === 0n) throw new Error("nothing to prove for this client");
+
+  // Local clock vs block.timestamp can drift by a few seconds on most chains —
+  // matters only at midnight UTC, and even then the contract is still the
+  // source of truth: a wrong skip here just defers the proof to the next sweep.
+  const nowSec = BigInt(Math.floor(Date.now() / 1000));
+  if (onChain.lastProof > 0n && onChain.lastProof / SECONDS_PER_DAY === nowSec / SECONDS_PER_DAY) {
+    throw new ProofCooldownActive();
+  }
 
   const challengeByte = onChain.challengeIndex * BigInt(CHUNK_SIZE);
   const files = listFiles(hdb, checked);

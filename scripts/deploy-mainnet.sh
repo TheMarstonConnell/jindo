@@ -8,4 +8,7 @@ if [[ "$ans" != "deploy mainnet" ]]; then
   exit 1
 fi
 
-exec "$(dirname "$0")/_deploy.sh" 8453 "https://mainnet.base.org"
+exec "$(dirname "$0")/_deploy.sh" \
+  8453 \
+  "https://mainnet.base.org" \
+  "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"

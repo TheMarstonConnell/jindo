@@ -113,7 +113,7 @@ async function readPairOnChain() {
     abi: JINDO_ABI,
     functionName: "contracts",
     args: [key],
-  })) as readonly [Address, bigint, Address, bigint, Hex];
+  })) as readonly [Address, bigint, Address, bigint, Hex, bigint, bigint];
   return { host, size, client, challengeIndex, root };
 }
 
@@ -270,7 +270,7 @@ test("host can answer the on-chain challenge with a valid proof", async () => {
     abi: JINDO_ABI,
     functionName: "contracts",
     args: [pairKey],
-  })) as readonly [Address, bigint, Address, bigint, Hex];
+  })) as readonly [Address, bigint, Address, bigint, Hex, bigint, bigint];
   const blockBeforeProof = await publicClient.getBlockNumber();
   expect(sizeBefore).toBe(BigInt(a.byteLength + b.byteLength));
   // 6 chunks → challengeIndex in [0, 6)
