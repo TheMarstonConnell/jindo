@@ -53,24 +53,6 @@ function chainName(chainId: number): string {
   }
 }
 
-function explorerAddrUrl(chainId: number, addr: string): string | null {
-  switch (chainId) {
-    case 1: return `https://etherscan.io/address/${addr}`;
-    case 11155111: return `https://sepolia.etherscan.io/address/${addr}`;
-    case 8453: return `https://basescan.org/address/${addr}`;
-    case 84532: return `https://sepolia.basescan.org/address/${addr}`;
-    case 10: return `https://optimistic.etherscan.io/address/${addr}`;
-    case 42161: return `https://arbiscan.io/address/${addr}`;
-    default: return null;
-  }
-}
-
-function fmtRateAsUsdPerGbMonth(rateBytePerDay: bigint): string {
-  // atto/byte/day × 1 GiB × 30 / 1e18 = USD per GiB per month.
-  const monthlyAttoPerGiB = rateBytePerDay * (1n << 30n) * 30n;
-  const monthlyUsdMicro = Number(monthlyAttoPerGiB / 1_000_000_000_000n); // base USDC (6 decimals)
-  return `$${(monthlyUsdMicro / 1e6).toFixed(4)}`;
-}
 import {
   blobIsLive,
   deleteFileRow,
@@ -444,122 +426,38 @@ async function handleDownload(fileRoot: Hex, hdb: HostDb): Promise<Response> {
 interface RootInfo {
   ctx: ChainContext;
   hdb: HostDb;
-  rateBytePerDay: bigint;
   usdcAddress: Address;
   startedAt: number;
 }
 
 function handleRoot(info: RootInfo): Response {
-  const { ctx, hdb, rateBytePerDay, usdcAddress, startedAt } = info;
+  const { ctx, hdb, usdcAddress, startedAt } = info;
   const summaries = listClientSummaries(hdb);
   const totalBytes = summaries.reduce((acc, s) => acc + BigInt(s.totalSize), 0n);
   const uptimeSec = Math.floor((Date.now() - startedAt) / 1000);
 
-  const explorerHost = explorerAddrUrl(ctx.chainId, ctx.account);
-  const explorerContract = explorerAddrUrl(ctx.chainId, ctx.contract);
-  const explorerUsdc = explorerAddrUrl(ctx.chainId, usdcAddress);
-  const link = (url: string | null, text: string) =>
-    url ? `<a href="${url}" target="_blank" rel="noreferrer">${text}</a>` : text;
+  const body = {
+    host: ctx.account,
+    chain: { id: ctx.chainId, name: chainName(ctx.chainId) },
+    contract: ctx.contract,
+    usdc: usdcAddress,
+    status: {
+      clients: summaries.length,
+      totalBytes: totalBytes.toString(),
+      totalBytesHuman: fmtBytes(totalBytes),
+      uptimeSeconds: uptimeSec,
+    },
+    endpoints: {
+      "GET /health": "JSON status",
+      "GET /clients": "all known clients on this host",
+      "GET /list/:client": "files for a client",
+      "GET /download/:fileRoot": "stream a blob",
+      "POST /upload": "multipart: signed intent + bytes",
+      "POST /delete": "JSON: signed delete intent",
+    },
+  };
 
-  const html = `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>jindo host · ${chainName(ctx.chainId)}</title>
-  <style>
-    :root {
-      color-scheme: light;
-      --bg: #fef9c3; --panel: #fff; --ink: #000; --muted: #4a4a4a;
-      font-family: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
-    }
-    * { box-sizing: border-box; }
-    body { margin: 0; background: var(--bg); color: var(--ink); padding: 40px 24px;
-      background-image: radial-gradient(rgba(0,0,0,0.07) 1px, transparent 1px);
-      background-size: 18px 18px; }
-    main { max-width: 880px; margin: 0 auto; display: flex; flex-direction: column; gap: 24px; }
-    h1 { margin: 0 0 4px; font-size: 56px; line-height: 0.95; letter-spacing: -0.03em;
-      font-weight: 800; text-transform: lowercase; }
-    p { margin: 0; }
-    .panel { background: var(--panel); border: 3px solid var(--ink); border-radius: 6px;
-      padding: 20px; box-shadow: 6px 6px 0 var(--ink); display: flex;
-      flex-direction: column; gap: 12px; }
-    .panel strong { font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; }
-    .kv { display: grid; grid-template-columns: max-content 1fr; column-gap: 16px;
-      row-gap: 8px; font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 13px; }
-    .kv > .k { font-weight: 800; text-transform: uppercase; font-size: 11px;
-      letter-spacing: 0.08em; align-self: center; }
-    .kv > .v { word-break: break-all; }
-    .muted { color: var(--muted); }
-    a { color: inherit; }
-    code { font-family: "JetBrains Mono", ui-monospace, monospace; }
-  </style>
-</head>
-<body>
-  <main>
-    <header>
-      <h1>jindo host</h1>
-      <p class="muted">A node on the Jindo storage network. Drop a wallet at the demo
-      and you can store files against this host.</p>
-    </header>
-
-    <section class="panel">
-      <strong>Identity</strong>
-      <div class="kv">
-        <div class="k">host</div><div class="v">${link(explorerHost, `<code>${ctx.account}</code>`)}</div>
-        <div class="k">chain</div><div class="v">${chainName(ctx.chainId)} <span class="muted">(${ctx.chainId})</span></div>
-        <div class="k">contract</div><div class="v">${link(explorerContract, `<code>${ctx.contract}</code>`)}</div>
-        <div class="k">USDC</div><div class="v">${link(explorerUsdc, `<code>${usdcAddress}</code>`)}</div>
-      </div>
-    </section>
-
-    <section class="panel">
-      <strong>Pricing</strong>
-      <div class="kv">
-        <div class="k">rate</div><div class="v">${fmtRateAsUsdPerGbMonth(rateBytePerDay)} / GB / month
-          <span class="muted">(${rateBytePerDay} atto/byte/day)</span></div>
-        <div class="k">cooldown</div><div class="v">1 paid proof per UTC day</div>
-        <div class="k">reserve required</div><div class="v">balance ≥ size × rate × 30 to upload</div>
-      </div>
-    </section>
-
-    <section class="panel">
-      <strong>Status</strong>
-      <div class="kv">
-        <div class="k">clients</div><div class="v">${summaries.length}</div>
-        <div class="k">total stored</div><div class="v">${fmtBytes(totalBytes)}
-          <span class="muted">(${String(totalBytes)} B)</span></div>
-        <div class="k">uptime</div><div class="v">${fmtUptime(uptimeSec)}</div>
-      </div>
-    </section>
-
-    <section class="panel">
-      <strong>Endpoints</strong>
-      <div class="kv">
-        <div class="k">GET /health</div><div class="v">JSON status</div>
-        <div class="k">GET /clients</div><div class="v">all known clients on this host</div>
-        <div class="k">GET /list/:client</div><div class="v">files for a client</div>
-        <div class="k">GET /download/:fileRoot</div><div class="v">stream a blob</div>
-        <div class="k">POST /upload</div><div class="v">multipart: signed intent + bytes</div>
-        <div class="k">POST /delete</div><div class="v">JSON: signed delete intent</div>
-      </div>
-    </section>
-  </main>
-</body>
-</html>`;
-
-  return withCors(
-    new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } }),
-  );
-}
-
-function fmtUptime(sec: number): string {
-  if (sec < 60) return `${sec}s`;
-  if (sec < 3600) return `${Math.floor(sec / 60)}m ${sec % 60}s`;
-  if (sec < 86400) return `${Math.floor(sec / 3600)}h ${Math.floor((sec % 3600) / 60)}m`;
-  const d = Math.floor(sec / 86400);
-  const h = Math.floor((sec % 86400) / 3600);
-  return `${d}d ${h}h`;
+  return withCors(Response.json(body));
 }
 
 async function proveAllClients(ctx: ChainContext, hdb: HostDb, env: HostEnv): Promise<void> {
@@ -612,7 +510,7 @@ export async function startHost(env: HostEnv): Promise<{ stop: () => void; url: 
     hostname: "0.0.0.0",
     routes: {
       "/": {
-        GET: () => handleRoot({ ctx, hdb, rateBytePerDay, usdcAddress, startedAt }),
+        GET: () => handleRoot({ ctx, hdb, usdcAddress, startedAt }),
         OPTIONS: corsPreflight,
       },
       "/health": {
