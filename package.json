@@ -11,6 +11,7 @@
     "web": "bun --hot web/serve.ts",
     "deploy:sepolia": "./scripts/deploy-sepolia.sh",
     "deploy:mainnet": "./scripts/deploy-mainnet.sh",
+    "slither": "./scripts/slither.sh",
     "test": "bun test"
   },
   "devDependencies": {

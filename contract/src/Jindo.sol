@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: UNLICENSED
-pragma solidity ^0.8.13;
+pragma solidity ^0.8.27;
 
 interface IERC20 {
     function transfer(address to, uint256 amount) external returns (bool);
@@ -75,6 +75,9 @@ contract Jindo {
     /// per-pair host check is sufficient and the griefing surface doesn't apply.
     mapping(address => uint128) public balance;
 
+    // intentional uppercase: USDC is the token's market symbol; matches every
+    // ERC-20 reference in the codebase.
+    // slither-disable-next-line naming-convention
     IERC20 public immutable USDC;
 
     mapping(bytes32 => Contract) public contracts;
@@ -129,6 +132,9 @@ contract Jindo {
         "Delete(address host,address client,bytes32 fileRoot,bytes32 priorRoot,bytes32 newRoot,uint64 newSize)"
     );
 
+    // intentional uppercase: this is the EIP-712 standard variable name used
+    // by every other implementation (OZ, Solady, etc.). Wallets show it.
+    // slither-disable-next-line naming-convention
     bytes32 public immutable DOMAIN_SEPARATOR;
 
     error NotAuthorized();
@@ -186,8 +192,8 @@ contract Jindo {
     function deposit(uint256 baseAmount) external {
         uint256 attoAmount = baseAmount * ATTO_PER_BASE;
         balance[msg.sender] += uint128(attoAmount);
-        if (!USDC.transferFrom(msg.sender, address(this), baseAmount)) revert TransferFailed();
         emit Deposited(msg.sender, baseAmount, attoAmount);
+        if (!USDC.transferFrom(msg.sender, address(this), baseAmount)) revert TransferFailed();
     }
 
     /// Client pulls unspent funds from their pool. The pool must keep at least
@@ -199,8 +205,8 @@ contract Jindo {
         uint128 bal = balance[msg.sender];
         if (attoAmount > _withdrawable(bal, msg.sender)) revert InsufficientBalance();
         balance[msg.sender] = bal - uint128(attoAmount);
-        if (!USDC.transfer(msg.sender, baseAmount)) revert TransferFailed();
         emit Withdrawn(msg.sender, baseAmount);
+        if (!USDC.transfer(msg.sender, baseAmount)) revert TransferFailed();
     }
 
     /// Charge the client one day of storage and credit it to the host's
@@ -224,9 +230,12 @@ contract Jindo {
 
         uint256 baseAmount = uint256(c.accrued) / ATTO_PER_BASE;
         if (baseAmount == 0) return;
+        // intentional: floor-divide atto → base units, scrub the floored portion,
+        // leave sub-base-unit dust for the next claim.
+        // slither-disable-next-line divide-before-multiply
         c.accrued -= uint128(baseAmount * ATTO_PER_BASE);
-        if (!USDC.transfer(msg.sender, baseAmount)) revert TransferFailed();
         emit EarningsClaimed(msg.sender, client, baseAmount);
+        if (!USDC.transfer(msg.sender, baseAmount)) revert TransferFailed();
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
@@ -265,16 +274,21 @@ contract Jindo {
         Contract storage c = contracts[k];
         if (c.host != msg.sender) revert NotAuthorized();
 
+        // Cache the values we need post-delete, then perform every state
+        // mutation (delete + index removal) BEFORE the external call. This is
+        // checks-effects-interactions: a hostile USDC token can't reenter into
+        // claimEarnings/commitProof/etc. and exploit a half-deleted pair.
         uint256 hostPayout = uint256(c.accrued) / ATTO_PER_BASE;
-        if (hostPayout > 0) {
-            if (!USDC.transfer(c.host, hostPayout)) revert TransferFailed();
-            emit EarningsClaimed(c.host, client, hostPayout);
-        }
+        address payHost = c.host;
 
         _removeFrom(hostsOfClient[client], msg.sender);
-
         delete contracts[k];
         emit ContractRemoved(msg.sender, client);
+
+        if (hostPayout > 0) {
+            emit EarningsClaimed(payHost, client, hostPayout);
+            if (!USDC.transfer(payHost, hostPayout)) revert TransferFailed();
+        }
     }
 
     /// @notice Host commits a data-availability proof for the current challenge.
@@ -325,7 +339,9 @@ contract Jindo {
         // that misses a UTC day forfeits that day's revenue. Unix timestamps
         // are seconds since 1970-01-01 00:00:00 UTC, so floor-dividing by
         // SECONDS_PER_DAY gives the UTC day number — same number means the
-        // last proof landed somewhere in today's window.
+        // last proof landed somewhere in today's window. The strict equality
+        // on a derived UTC-day index is the cooldown's whole semantic.
+        // slither-disable-next-line incorrect-equality,timestamp
         if (uint256(c.lastProof) / SECONDS_PER_DAY == block.timestamp / SECONDS_PER_DAY) {
             revert CooldownActive();
         }
@@ -383,7 +399,12 @@ contract Jindo {
             totalChunks = (uint256(size) + CHUNK_SIZE - 1) / CHUNK_SIZE;
         }
         bytes32 prevHash = blockhash(block.number - 1);
+        // intentional weak prng: prevHash + k + root only needs to be
+        // unpredictable to the host, not cryptographically strong. The worst
+        // a block proposer can do is influence one challenge by one block;
+        // they still can't pick a chunk they don't store.
         uint256 seed = uint256(keccak256(abi.encodePacked(prevHash, k, c.root)));
+        // slither-disable-next-line weak-prng
         uint64 newIndex = uint64(seed % totalChunks);
         c.challengeIndex = newIndex;
         emit ChallengeRotated(host, client, newIndex, block.number);
