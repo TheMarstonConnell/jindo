@@ -61,3 +61,21 @@ export function loadClient(): ClientEnv {
     cacheDir: process.env.JINDO_CACHE_DIR ?? `${home}/.jindo/cache`,
   };
 }
+
+export interface S3GatewayEnv extends CommonEnv {
+  port: number;
+  dataDir: string;
+  cacheDir: string;
+  jindoHostUrl: string;
+}
+
+export function loadS3Gateway(): S3GatewayEnv {
+  const home = process.env.HOME ?? ".";
+  return {
+    ...loadCommon(),
+    port: Number(process.env.JINDO_S3_PORT ?? 5690),
+    dataDir: process.env.JINDO_S3_DATA_DIR ?? "./data/s3",
+    cacheDir: process.env.JINDO_S3_CACHE_DIR ?? `${home}/.jindo/s3-cache`,
+    jindoHostUrl: required("JINDO_HOST_URL"),
+  };
+}

@@ -1,41 +1,17 @@
 import type { Address, Hex } from "viem";
 import { buildDomain, TYPES } from "../shared/eip712.ts";
 import { fileRoot as computeFileRoot, outerRoot as computeOuterRoot } from "../shared/merkle.ts";
-import { buildChainContext, readPair, type ChainContext } from "../shared/chain.ts";
+import {
+  ERC20_ABI,
+  buildChainContext,
+  readPair,
+  submitDepositUsdc,
+  type ChainContext,
+} from "../shared/chain.ts";
 import { JINDO_ABI } from "../shared/abi.ts";
 import type { FileRecord, PairState } from "../shared/types.ts";
 import type { CacheFactory, CacheStore } from "./cache.ts";
 import { fetchHostAddress, fetchList, postDelete, postUpload } from "./host-client.ts";
-
-const ERC20_ABI = [
-  {
-    type: "function",
-    name: "balanceOf",
-    stateMutability: "view",
-    inputs: [{ name: "account", type: "address" }],
-    outputs: [{ type: "uint256" }],
-  },
-  {
-    type: "function",
-    name: "allowance",
-    stateMutability: "view",
-    inputs: [
-      { name: "owner", type: "address" },
-      { name: "spender", type: "address" },
-    ],
-    outputs: [{ type: "uint256" }],
-  },
-  {
-    type: "function",
-    name: "approve",
-    stateMutability: "nonpayable",
-    inputs: [
-      { name: "spender", type: "address" },
-      { name: "amount", type: "uint256" },
-    ],
-    outputs: [{ type: "bool" }],
-  },
-] as const;
 
 export interface JindoClientOptions {
   rpcUrl: string;
@@ -326,41 +302,11 @@ export class JindoClient {
   /// Deposit USDC. If the wallet has already granted enough allowance to the
   /// Jindo contract, the approve step is skipped — so most subsequent deposits
   /// only prompt MetaMask once. The approveHash is `null` when skipped.
-  async depositUsdc(
+  depositUsdc(
     baseAmount: bigint,
     opts?: { onStage?: (stage: "approve" | "deposit") => void },
   ): Promise<{ approveHash: Hex | null; depositHash: Hex }> {
-    const account = this.ctx.walletClient.account;
-    if (!account) throw new Error("walletClient missing account");
-    const usdc = await this.usdcAddress();
-
-    let approveHash: Hex | null = null;
-    const currentAllowance = await this.usdcAllowance();
-    if (currentAllowance < baseAmount) {
-      opts?.onStage?.("approve");
-      approveHash = await this.ctx.walletClient.writeContract({
-        account,
-        chain: null,
-        address: usdc,
-        abi: ERC20_ABI,
-        functionName: "approve",
-        args: [this.ctx.contract, baseAmount],
-      });
-      await this.ctx.publicClient.waitForTransactionReceipt({ hash: approveHash });
-    }
-
-    opts?.onStage?.("deposit");
-    const depositHash = await this.ctx.walletClient.writeContract({
-      account,
-      chain: null,
-      address: this.ctx.contract,
-      abi: JINDO_ABI,
-      functionName: "deposit",
-      args: [baseAmount],
-    });
-    await this.ctx.publicClient.waitForTransactionReceipt({ hash: depositHash });
-
-    return { approveHash, depositHash };
+    return submitDepositUsdc(this.ctx, baseAmount, opts);
   }
 
   /// Pull `baseAmount` USDC out of the contract pool back to the connected wallet.

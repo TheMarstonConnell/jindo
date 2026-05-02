@@ -4,6 +4,36 @@ import { privateKeyToAccount } from "viem/accounts";
 import { JINDO_ABI } from "./abi.ts";
 import type { PairState } from "./types.ts";
 
+export const ERC20_ABI = [
+  {
+    type: "function",
+    name: "balanceOf",
+    stateMutability: "view",
+    inputs: [{ name: "account", type: "address" }],
+    outputs: [{ type: "uint256" }],
+  },
+  {
+    type: "function",
+    name: "allowance",
+    stateMutability: "view",
+    inputs: [
+      { name: "owner", type: "address" },
+      { name: "spender", type: "address" },
+    ],
+    outputs: [{ type: "uint256" }],
+  },
+  {
+    type: "function",
+    name: "approve",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "spender", type: "address" },
+      { name: "amount", type: "uint256" },
+    ],
+    outputs: [{ type: "bool" }],
+  },
+] as const;
+
 export interface ChainContext {
   chainId: number;
   contract: Address;
@@ -136,6 +166,74 @@ export async function readPair(
     lastProof,
     accrued,
   };
+}
+
+/// Approve at least `baseAmount` USDC for the Jindo contract, waiting for the
+/// approval tx to be mined before returning. Skips the tx entirely when the
+/// wallet already has sufficient allowance — the returned `approveHash` is
+/// `null` in that case.
+export async function submitApproveUsdc(
+  ctx: ChainContext,
+  baseAmount: bigint,
+): Promise<{ approveHash: Hex | null; skipped: boolean }> {
+  const account = ctx.walletClient.account;
+  if (!account) throw new Error("walletClient missing account");
+
+  const usdc = (await ctx.publicClient.readContract({
+    address: ctx.contract,
+    abi: JINDO_ABI,
+    functionName: "USDC",
+  })) as Address;
+
+  const currentAllowance = (await ctx.publicClient.readContract({
+    address: usdc,
+    abi: ERC20_ABI,
+    functionName: "allowance",
+    args: [ctx.account, ctx.contract],
+  })) as bigint;
+
+  if (currentAllowance >= baseAmount) {
+    return { approveHash: null, skipped: true };
+  }
+
+  const approveHash = await ctx.walletClient.writeContract({
+    account,
+    chain: null,
+    address: usdc,
+    abi: ERC20_ABI,
+    functionName: "approve",
+    args: [ctx.contract, baseAmount],
+  });
+  await ctx.publicClient.waitForTransactionReceipt({ hash: approveHash });
+  return { approveHash, skipped: false };
+}
+
+/// One-shot approve+deposit. Convenience wrapper used by the library; the CLI
+/// calls submitApproveUsdc and the deposit tx separately so each stage is
+/// individually visible.
+export async function submitDepositUsdc(
+  ctx: ChainContext,
+  baseAmount: bigint,
+  opts?: { onStage?: (stage: "approve" | "deposit") => void },
+): Promise<{ approveHash: Hex | null; depositHash: Hex }> {
+  const account = ctx.walletClient.account;
+  if (!account) throw new Error("walletClient missing account");
+
+  opts?.onStage?.("approve");
+  const { approveHash } = await submitApproveUsdc(ctx, baseAmount);
+
+  opts?.onStage?.("deposit");
+  const depositHash = await ctx.walletClient.writeContract({
+    account,
+    chain: null,
+    address: ctx.contract,
+    abi: JINDO_ABI,
+    functionName: "deposit",
+    args: [baseAmount],
+  });
+  await ctx.publicClient.waitForTransactionReceipt({ hash: depositHash });
+
+  return { approveHash, depositHash };
 }
 
 export async function submitClaimEarnings(

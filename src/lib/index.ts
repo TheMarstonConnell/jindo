@@ -5,6 +5,7 @@ export { memoryCacheFactory } from "./memory-cache.ts";
 export {
   fetchHostAddress,
   fetchList,
+  fetchDownload,
   postDelete,
   postUpload,
 } from "./host-client.ts";
@@ -33,6 +34,7 @@ export {
   submitCommitUpload,
   submitCommitDelete,
   submitCommitProof,
+  submitDepositUsdc,
 } from "../shared/chain.ts";
 export type { ChainContext, OnChainPair } from "../shared/chain.ts";
 export {

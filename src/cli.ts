@@ -2,11 +2,28 @@
 import { Command } from "commander";
 import type { Address, Hex } from "viem";
 import { JindoClient } from "./lib/index.ts";
+import { JINDO_ABI } from "./shared/abi.ts";
+import { buildChainContext, submitApproveUsdc } from "./shared/chain.ts";
 import { startHost } from "./host/server.ts";
+import { startS3 } from "./s3/index.ts";
 import { prove } from "./host/prove.ts";
 import { withdrawAll } from "./host/withdraw.ts";
-import { loadClient, loadHost } from "./node/env.ts";
+import { loadClient, loadHost, loadS3Gateway } from "./node/env.ts";
 import { sqliteCacheFactory } from "./node/sqlite-cache.ts";
+
+/// Parse a USDC string (e.g. "1.5", "100", "0.000001") into 6-decimal base units.
+/// Throws on bad input or excess precision.
+function parseUsdc(input: string): bigint {
+  if (!/^\d+(\.\d+)?$/.test(input)) {
+    throw new Error(`invalid USDC amount: ${input}`);
+  }
+  const [whole, frac = ""] = input.split(".");
+  if (frac.length > 6) {
+    throw new Error(`USDC supports at most 6 decimal places (got ${frac.length})`);
+  }
+  const padded = (frac + "000000").slice(0, 6);
+  return BigInt(whole!) * 1_000_000n + BigInt(padded || "0");
+}
 
 async function openClient(hostUrl: string): Promise<JindoClient> {
   const env = loadClient();
@@ -27,6 +44,13 @@ program
   .description("run a storage host (Bun.serve)")
   .action(async () => {
     await startHost(loadHost());
+  });
+
+program
+  .command("s3")
+  .description("run an S3-compatible gateway backed by a jindo host")
+  .action(async () => {
+    await startS3(loadS3Gateway());
   });
 
 program
@@ -88,6 +112,42 @@ program
     const jindo = await openClient(opts.host);
     const out = await jindo.recover();
     console.log(`recovered ${out.files.length} files\n  outer: ${out.outerRoot}`);
+  });
+
+program
+  .command("deposit")
+  .description("deposit USDC into the Jindo contract (auto-approves if needed)")
+  .argument("<amount>", "USDC amount with up to 6 decimals (e.g. 1.5)")
+  .action(async (amount: string) => {
+    const baseAmount = parseUsdc(amount);
+    const env = loadClient();
+    const ctx = await buildChainContext({
+      rpcUrl: env.rpcUrl,
+      privateKey: env.privateKey,
+      contract: env.contract,
+    });
+
+    console.log(`→ approving ${amount} USDC for ${ctx.contract}…`);
+    const { approveHash, skipped } = await submitApproveUsdc(ctx, baseAmount);
+    if (skipped) {
+      console.log("  (allowance already sufficient, skipped)");
+    } else {
+      console.log(`  approve tx: ${approveHash}`);
+      console.log("  approval mined");
+    }
+
+    console.log(`→ depositing ${amount} USDC…`);
+    const depositHash = await ctx.walletClient.writeContract({
+      account: ctx.walletClient.account!,
+      chain: null,
+      address: ctx.contract,
+      abi: JINDO_ABI,
+      functionName: "deposit",
+      args: [baseAmount],
+    });
+    console.log(`  deposit tx: ${depositHash}`);
+    await ctx.publicClient.waitForTransactionReceipt({ hash: depositHash });
+    console.log(`  deposit mined — ${amount} USDC credited`);
   });
 
 program

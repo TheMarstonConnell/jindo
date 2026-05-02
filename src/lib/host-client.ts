@@ -43,6 +43,12 @@ export async function postUpload(
   return (await res.json()) as { txHash: Hex; outerRoot: Hex };
 }
 
+export async function fetchDownload(hostUrl: string, fileRoot: Hex): Promise<Uint8Array> {
+  const res = await fetch(`${stripTrail(hostUrl)}/download/${fileRoot}`);
+  if (!res.ok) throw new Error(`download failed: ${res.status}`);
+  return new Uint8Array(await res.arrayBuffer());
+}
+
 export async function postDelete(
   hostUrl: string,
   body: unknown,
