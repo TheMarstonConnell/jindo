@@ -145,14 +145,9 @@ contract JindoTest is Test {
     /// commitUpload. Lets the existing single-file tests stay readable —
     /// vm.prank set just before this call still applies because the only
     /// external call inside is jindo.commitUpload.
-    function _commitOne(
-        address c,
-        bytes32 root,
-        bytes32 prior,
-        bytes32 newRoot,
-        uint64 newSize,
-        bytes memory sig
-    ) internal {
+    function _commitOne(address c, bytes32 root, bytes32 prior, bytes32 newRoot, uint64 newSize, bytes memory sig)
+        internal
+    {
         bytes32[] memory roots = new bytes32[](1);
         roots[0] = root;
         jindo.commitUpload(c, roots, prior, newRoot, newSize, sig);
@@ -203,9 +198,7 @@ contract JindoTest is Test {
         roots[0] = FILE_ROOT_1;
         roots[1] = FILE_ROOT_2;
 
-        bytes memory sig = _signUploadBatch(
-            CLIENT_PK, host, client, roots, bytes32(0), ROOT_1, 350
-        );
+        bytes memory sig = _signUploadBatch(CLIENT_PK, host, client, roots, bytes32(0), ROOT_1, 350);
 
         vm.prank(host);
         jindo.commitUpload(client, roots, bytes32(0), ROOT_1, 350, sig);
@@ -221,9 +214,7 @@ contract JindoTest is Test {
         roots[0] = FILE_ROOT_1;
         roots[1] = FILE_ROOT_2;
 
-        bytes memory sig = _signUploadBatch(
-            CLIENT_PK, host, client, roots, bytes32(0), ROOT_1, 350
-        );
+        bytes memory sig = _signUploadBatch(CLIENT_PK, host, client, roots, bytes32(0), ROOT_1, 350);
 
         vm.prank(host);
         vm.expectRevert(Jindo.BadSignature.selector);
@@ -235,9 +226,7 @@ contract JindoTest is Test {
         bytes32[] memory signed = new bytes32[](2);
         signed[0] = FILE_ROOT_1;
         signed[1] = FILE_ROOT_2;
-        bytes memory sig = _signUploadBatch(
-            CLIENT_PK, host, client, signed, bytes32(0), ROOT_1, 350
-        );
+        bytes memory sig = _signUploadBatch(CLIENT_PK, host, client, signed, bytes32(0), ROOT_1, 350);
 
         bytes32[] memory tampered = new bytes32[](2);
         tampered[0] = FILE_ROOT_2;
@@ -250,9 +239,7 @@ contract JindoTest is Test {
 
     function test_commitUpload_batchRejectsEmptyArray() public {
         bytes32[] memory empty = new bytes32[](0);
-        bytes memory sig = _signUploadBatch(
-            CLIENT_PK, host, client, empty, bytes32(0), ROOT_1, 0
-        );
+        bytes memory sig = _signUploadBatch(CLIENT_PK, host, client, empty, bytes32(0), ROOT_1, 0);
 
         vm.prank(host);
         vm.expectRevert(Jindo.NoData.selector);
