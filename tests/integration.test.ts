@@ -125,7 +125,8 @@ test("upload → list → delete → recover roundtrip", async () => {
   const bytes1 = new Uint8Array(8192);
   for (let i = 0; i < bytes1.length; i++) bytes1[i] = i % 251;
 
-  const fileRoot1 = await jindo.upload(bytes1);
+  const r1 = await jindo.upload([bytes1]);
+  const fileRoot1 = r1.fileRoots[0]!;
   expect(fileRoot1).toBe(computeFileRoot(bytes1));
 
   let onChain = await readPairOnChain();
@@ -141,7 +142,8 @@ test("upload → list → delete → recover roundtrip", async () => {
   const bytes2 = new Uint8Array(1024);
   for (let i = 0; i < bytes2.length; i++) bytes2[i] = (i * 7) % 251;
 
-  const fileRoot2 = await jindo.upload(bytes2);
+  const r2 = await jindo.upload([bytes2]);
+  const fileRoot2 = r2.fileRoots[0]!;
   expect(fileRoot2).toBe(computeFileRoot(bytes2));
   expect(fileRoot2).not.toBe(fileRoot1);
 
@@ -202,7 +204,7 @@ test("host rejects upload when signature client does not match recovered signer"
   const message = {
     host: HOST_ADDRESS,
     client: CLIENT_ADDRESS, // claim to be the legitimate client
-    fileRoot,
+    fileRoots: [fileRoot],
     priorRoot: ZERO_ROOT,
     newRoot,
     newSize: 3n,
@@ -220,7 +222,7 @@ test("host rejects upload when signature client does not match recovered signer"
     "intent",
     JSON.stringify({
       client: CLIENT_ADDRESS,
-      fileRoot,
+      fileRoots: [fileRoot],
       priorRoot: ZERO_ROOT,
       newRoot,
       newSize: "3",
@@ -255,8 +257,8 @@ test("host can answer the on-chain challenge with a valid proof", async () => {
   const b = new Uint8Array(2048);
   for (let i = 0; i < b.length; i++) b[i] = (i * 29 + 7) & 0xff;
 
-  await fresh.upload(a);
-  await fresh.upload(b);
+  await fresh.upload([a]);
+  await fresh.upload([b]);
 
   // Read the on-chain pair and confirm a challenge has been set.
   const pairKey = (await publicClient.readContract({

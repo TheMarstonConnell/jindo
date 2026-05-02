@@ -123,7 +123,7 @@ export const JINDO_ABI = [
     stateMutability: "nonpayable",
     inputs: [
       { name: "client", type: "address" },
-      { name: "fileRoot", type: "bytes32" },
+      { name: "fileRoots", type: "bytes32[]" },
       { name: "priorRoot", type: "bytes32" },
       { name: "newRoot", type: "bytes32" },
       { name: "newSize", type: "uint64" },

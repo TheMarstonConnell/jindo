@@ -63,7 +63,7 @@ contract JindoTest is Test {
     bytes32 constant FILE_ROOT_2 = bytes32(uint256(0x222));
 
     bytes32 constant UPLOAD_TYPEHASH = keccak256(
-        "Upload(address host,address client,bytes32 fileRoot,bytes32 priorRoot,bytes32 newRoot,uint64 newSize)"
+        "Upload(address host,address client,bytes32[] fileRoots,bytes32 priorRoot,bytes32 newRoot,uint64 newSize)"
     );
     bytes32 constant DELETE_TYPEHASH = keccak256(
         "Delete(address host,address client,bytes32 fileRoot,bytes32 priorRoot,bytes32 newRoot,uint64 newSize)"
@@ -110,6 +110,8 @@ contract JindoTest is Test {
         return abi.encodePacked(r, s, v);
     }
 
+    /// Sign a single-file upload intent. Helper for tests that don't care about
+    /// batching — wraps the file root in a 1-element array and signs the batch.
     function _signUpload(
         uint256 pk,
         address h,
@@ -119,7 +121,41 @@ contract JindoTest is Test {
         bytes32 newRoot,
         uint256 newSize
     ) internal view returns (bytes memory) {
-        return _signWith(pk, _digest(UPLOAD_TYPEHASH, h, c, fileRoot, priorRoot, newRoot, newSize));
+        bytes32[] memory roots = new bytes32[](1);
+        roots[0] = fileRoot;
+        return _signUploadBatch(pk, h, c, roots, priorRoot, newRoot, newSize);
+    }
+
+    /// Sign a multi-file upload intent. EIP-712 hashes bytes32[] as
+    /// keccak256(abi.encodePacked(elements)).
+    function _signUploadBatch(
+        uint256 pk,
+        address h,
+        address c,
+        bytes32[] memory fileRoots,
+        bytes32 priorRoot,
+        bytes32 newRoot,
+        uint256 newSize
+    ) internal view returns (bytes memory) {
+        bytes32 fileRootsHash = keccak256(abi.encodePacked(fileRoots));
+        return _signWith(pk, _digest(UPLOAD_TYPEHASH, h, c, fileRootsHash, priorRoot, newRoot, newSize));
+    }
+
+    /// Wraps a single fileRoot into a 1-element batch and forwards to the real
+    /// commitUpload. Lets the existing single-file tests stay readable —
+    /// vm.prank set just before this call still applies because the only
+    /// external call inside is jindo.commitUpload.
+    function _commitOne(
+        address c,
+        bytes32 root,
+        bytes32 prior,
+        bytes32 newRoot,
+        uint64 newSize,
+        bytes memory sig
+    ) internal {
+        bytes32[] memory roots = new bytes32[](1);
+        roots[0] = root;
+        jindo.commitUpload(c, roots, prior, newRoot, newSize, sig);
     }
 
     function _signDelete(
@@ -137,7 +173,7 @@ contract JindoTest is Test {
     function test_commitUpload_firstCallCreatesContract() public {
         bytes memory sig = _signUpload(CLIENT_PK, host, client, FILE_ROOT_1, bytes32(0), ROOT_1, 100);
         vm.prank(host);
-        jindo.commitUpload(client, FILE_ROOT_1, bytes32(0), ROOT_1, 100, sig);
+        _commitOne(client, FILE_ROOT_1, bytes32(0), ROOT_1, 100, sig);
 
         Jindo.Contract memory c = _read(host, client);
         assertEq(c.host, host);
@@ -150,41 +186,103 @@ contract JindoTest is Test {
     function test_commitUpload_subsequentCallUpdates() public {
         bytes memory sig1 = _signUpload(CLIENT_PK, host, client, FILE_ROOT_1, bytes32(0), ROOT_1, 100);
         vm.prank(host);
-        jindo.commitUpload(client, FILE_ROOT_1, bytes32(0), ROOT_1, 100, sig1);
+        _commitOne(client, FILE_ROOT_1, bytes32(0), ROOT_1, 100, sig1);
 
         bytes memory sig2 = _signUpload(CLIENT_PK, host, client, FILE_ROOT_2, ROOT_1, ROOT_2, 250);
         vm.prank(host);
-        jindo.commitUpload(client, FILE_ROOT_2, ROOT_1, ROOT_2, 250, sig2);
+        _commitOne(client, FILE_ROOT_2, ROOT_1, ROOT_2, 250, sig2);
 
         Jindo.Contract memory c = _read(host, client);
         assertEq(c.root, ROOT_2);
         assertEq(c.size, 250);
     }
 
+    function test_commitUpload_batchOfTwoFiles_singleSignature() public {
+        // Two files committed in one transaction with one client signature.
+        bytes32[] memory roots = new bytes32[](2);
+        roots[0] = FILE_ROOT_1;
+        roots[1] = FILE_ROOT_2;
+
+        bytes memory sig = _signUploadBatch(
+            CLIENT_PK, host, client, roots, bytes32(0), ROOT_1, 350
+        );
+
+        vm.prank(host);
+        jindo.commitUpload(client, roots, bytes32(0), ROOT_1, 350, sig);
+
+        Jindo.Contract memory c = _read(host, client);
+        assertEq(c.root, ROOT_1);
+        assertEq(c.size, 350);
+    }
+
+    function test_commitUpload_batchRejectsBadSignature() public {
+        // Bundle signed with a different priorRoot than the call uses.
+        bytes32[] memory roots = new bytes32[](2);
+        roots[0] = FILE_ROOT_1;
+        roots[1] = FILE_ROOT_2;
+
+        bytes memory sig = _signUploadBatch(
+            CLIENT_PK, host, client, roots, bytes32(0), ROOT_1, 350
+        );
+
+        vm.prank(host);
+        vm.expectRevert(Jindo.BadSignature.selector);
+        jindo.commitUpload(client, roots, ROOT_2, ROOT_1, 350, sig);
+    }
+
+    function test_commitUpload_batchRejectsTamperedRootOrder() public {
+        // Sign with [A, B], submit [B, A] — different fileRootsHash, sig must fail.
+        bytes32[] memory signed = new bytes32[](2);
+        signed[0] = FILE_ROOT_1;
+        signed[1] = FILE_ROOT_2;
+        bytes memory sig = _signUploadBatch(
+            CLIENT_PK, host, client, signed, bytes32(0), ROOT_1, 350
+        );
+
+        bytes32[] memory tampered = new bytes32[](2);
+        tampered[0] = FILE_ROOT_2;
+        tampered[1] = FILE_ROOT_1;
+
+        vm.prank(host);
+        vm.expectRevert(Jindo.BadSignature.selector);
+        jindo.commitUpload(client, tampered, bytes32(0), ROOT_1, 350, sig);
+    }
+
+    function test_commitUpload_batchRejectsEmptyArray() public {
+        bytes32[] memory empty = new bytes32[](0);
+        bytes memory sig = _signUploadBatch(
+            CLIENT_PK, host, client, empty, bytes32(0), ROOT_1, 0
+        );
+
+        vm.prank(host);
+        vm.expectRevert(Jindo.NoData.selector);
+        jindo.commitUpload(client, empty, bytes32(0), ROOT_1, 0, sig);
+    }
+
     function test_commitUpload_revertsOnPriorRootMismatch() public {
         bytes memory sig1 = _signUpload(CLIENT_PK, host, client, FILE_ROOT_1, bytes32(0), ROOT_1, 100);
         vm.prank(host);
-        jindo.commitUpload(client, FILE_ROOT_1, bytes32(0), ROOT_1, 100, sig1);
+        _commitOne(client, FILE_ROOT_1, bytes32(0), ROOT_1, 100, sig1);
 
         // signed with the wrong priorRoot
         bytes memory sig2 = _signUpload(CLIENT_PK, host, client, FILE_ROOT_2, ROOT_2, ROOT_1, 250);
         vm.prank(host);
         vm.expectRevert(Jindo.PriorRootMismatch.selector);
-        jindo.commitUpload(client, FILE_ROOT_2, ROOT_2, ROOT_1, 250, sig2);
+        _commitOne(client, FILE_ROOT_2, ROOT_2, ROOT_1, 250, sig2);
     }
 
     function test_commitUpload_revertsIfFirstCallHasNonZeroPriorRoot() public {
         bytes memory sig = _signUpload(CLIENT_PK, host, client, FILE_ROOT_1, ROOT_1, ROOT_2, 100);
         vm.prank(host);
         vm.expectRevert(Jindo.PriorRootRequiredZero.selector);
-        jindo.commitUpload(client, FILE_ROOT_1, ROOT_1, ROOT_2, 100, sig);
+        _commitOne(client, FILE_ROOT_1, ROOT_1, ROOT_2, 100, sig);
     }
 
     function test_commitUpload_revertsOnSignatureFromWrongKey() public {
         bytes memory sig = _signUpload(OTHER_PK, host, client, FILE_ROOT_1, bytes32(0), ROOT_1, 100);
         vm.prank(host);
         vm.expectRevert(Jindo.BadSignature.selector);
-        jindo.commitUpload(client, FILE_ROOT_1, bytes32(0), ROOT_1, 100, sig);
+        _commitOne(client, FILE_ROOT_1, bytes32(0), ROOT_1, 100, sig);
     }
 
     function test_commitUpload_revertsIfTamperedAfterSigning() public {
@@ -192,7 +290,7 @@ contract JindoTest is Test {
         // host inflates the size in the call
         vm.prank(host);
         vm.expectRevert(Jindo.BadSignature.selector);
-        jindo.commitUpload(client, FILE_ROOT_1, bytes32(0), ROOT_1, 999, sig);
+        _commitOne(client, FILE_ROOT_1, bytes32(0), ROOT_1, 999, sig);
     }
 
     function test_commitUpload_revertsIfHostUsesOtherHostsHostField() public {
@@ -200,7 +298,7 @@ contract JindoTest is Test {
         bytes memory sig = _signUpload(CLIENT_PK, host, client, FILE_ROOT_1, bytes32(0), ROOT_1, 100);
         vm.prank(otherHost);
         vm.expectRevert(Jindo.BadSignature.selector);
-        jindo.commitUpload(client, FILE_ROOT_1, bytes32(0), ROOT_1, 100, sig);
+        _commitOne(client, FILE_ROOT_1, bytes32(0), ROOT_1, 100, sig);
     }
 
     function test_commitUpload_rejectsDeleteSignature() public {
@@ -208,14 +306,14 @@ contract JindoTest is Test {
         bytes memory sig = _signDelete(CLIENT_PK, host, client, FILE_ROOT_1, bytes32(0), ROOT_1, 100);
         vm.prank(host);
         vm.expectRevert(Jindo.BadSignature.selector);
-        jindo.commitUpload(client, FILE_ROOT_1, bytes32(0), ROOT_1, 100, sig);
+        _commitOne(client, FILE_ROOT_1, bytes32(0), ROOT_1, 100, sig);
     }
 
     function test_commitDelete_works() public {
         // create first
         bytes memory upSig = _signUpload(CLIENT_PK, host, client, FILE_ROOT_1, bytes32(0), ROOT_1, 100);
         vm.prank(host);
-        jindo.commitUpload(client, FILE_ROOT_1, bytes32(0), ROOT_1, 100, upSig);
+        _commitOne(client, FILE_ROOT_1, bytes32(0), ROOT_1, 100, upSig);
 
         // delete with a Delete-typed signature
         bytes memory delSig = _signDelete(CLIENT_PK, host, client, FILE_ROOT_1, ROOT_1, bytes32(0), 0);
@@ -230,7 +328,7 @@ contract JindoTest is Test {
     function test_commitDelete_rejectsUploadSignature() public {
         bytes memory upSig = _signUpload(CLIENT_PK, host, client, FILE_ROOT_1, bytes32(0), ROOT_1, 100);
         vm.prank(host);
-        jindo.commitUpload(client, FILE_ROOT_1, bytes32(0), ROOT_1, 100, upSig);
+        _commitOne(client, FILE_ROOT_1, bytes32(0), ROOT_1, 100, upSig);
 
         bytes memory wrongSig = _signUpload(CLIENT_PK, host, client, FILE_ROOT_1, ROOT_1, bytes32(0), 0);
         vm.prank(host);
@@ -241,7 +339,7 @@ contract JindoTest is Test {
     function test_remove_clearsContract() public {
         bytes memory sig = _signUpload(CLIENT_PK, host, client, FILE_ROOT_1, bytes32(0), ROOT_1, 100);
         vm.prank(host);
-        jindo.commitUpload(client, FILE_ROOT_1, bytes32(0), ROOT_1, 100, sig);
+        _commitOne(client, FILE_ROOT_1, bytes32(0), ROOT_1, 100, sig);
 
         vm.prank(host);
         jindo.remove(client);
@@ -254,7 +352,7 @@ contract JindoTest is Test {
     function test_remove_revertsIfNotHost() public {
         bytes memory sig = _signUpload(CLIENT_PK, host, client, FILE_ROOT_1, bytes32(0), ROOT_1, 100);
         vm.prank(host);
-        jindo.commitUpload(client, FILE_ROOT_1, bytes32(0), ROOT_1, 100, sig);
+        _commitOne(client, FILE_ROOT_1, bytes32(0), ROOT_1, 100, sig);
 
         vm.prank(otherHost);
         vm.expectRevert(Jindo.NotAuthorized.selector);
@@ -266,11 +364,11 @@ contract JindoTest is Test {
         // move into slot 0 of hostsOfClient, length goes 2 → 1.
         bytes memory sigA = _signUpload(CLIENT_PK, host, client, FILE_ROOT_1, bytes32(0), ROOT_1, 100);
         vm.prank(host);
-        jindo.commitUpload(client, FILE_ROOT_1, bytes32(0), ROOT_1, 100, sigA);
+        _commitOne(client, FILE_ROOT_1, bytes32(0), ROOT_1, 100, sigA);
 
         bytes memory sigB = _signUpload(CLIENT_PK, otherHost, client, FILE_ROOT_2, bytes32(0), ROOT_2, 200);
         vm.prank(otherHost);
-        jindo.commitUpload(client, FILE_ROOT_2, bytes32(0), ROOT_2, 200, sigB);
+        _commitOne(client, FILE_ROOT_2, bytes32(0), ROOT_2, 200, sigB);
 
         vm.prank(host);
         jindo.remove(client);
@@ -283,11 +381,11 @@ contract JindoTest is Test {
     function test_clientCanHaveMultipleHosts() public {
         bytes memory sig1 = _signUpload(CLIENT_PK, host, client, FILE_ROOT_1, bytes32(0), ROOT_1, 100);
         vm.prank(host);
-        jindo.commitUpload(client, FILE_ROOT_1, bytes32(0), ROOT_1, 100, sig1);
+        _commitOne(client, FILE_ROOT_1, bytes32(0), ROOT_1, 100, sig1);
 
         bytes memory sig2 = _signUpload(CLIENT_PK, otherHost, client, FILE_ROOT_2, bytes32(0), ROOT_2, 200);
         vm.prank(otherHost);
-        jindo.commitUpload(client, FILE_ROOT_2, bytes32(0), ROOT_2, 200, sig2);
+        _commitOne(client, FILE_ROOT_2, bytes32(0), ROOT_2, 200, sig2);
 
         Jindo.Contract memory a = _read(host, client);
         Jindo.Contract memory b = _read(otherHost, client);
@@ -319,7 +417,7 @@ contract JindoTest is Test {
 
         bytes memory upSig = _signUpload(CLIENT_PK, host, client, fr, bytes32(0), outerRoot, 2048);
         vm.prank(host);
-        jindo.commitUpload(client, fr, bytes32(0), outerRoot, 2048, upSig);
+        _commitOne(client, fr, bytes32(0), outerRoot, 2048, upSig);
 
         Jindo.Contract memory c = _read(host, client);
         assertTrue(c.challengeIndex < 2);
@@ -363,7 +461,7 @@ contract JindoTest is Test {
 
         bytes memory upSig = _signUpload(CLIENT_PK, host, client, fr, bytes32(0), outerRoot, 1024);
         vm.prank(host);
-        jindo.commitUpload(client, fr, bytes32(0), outerRoot, 1024, upSig);
+        _commitOne(client, fr, bytes32(0), outerRoot, 1024, upSig);
 
         // Tamper: claim a different fileRoot which can't appear in the (single-leaf) outer tree.
         bytes32 fakeFr = keccak256("totally fake");
@@ -380,7 +478,7 @@ contract JindoTest is Test {
 
         bytes memory upSig = _signUpload(CLIENT_PK, host, client, fr, bytes32(0), outerRoot, 1024);
         vm.prank(host);
-        jindo.commitUpload(client, fr, bytes32(0), outerRoot, 1024, upSig);
+        _commitOne(client, fr, bytes32(0), outerRoot, 1024, upSig);
 
         bytes memory tampered = new bytes(1024);
         tampered[0] = 0x01; // any single byte difference
@@ -397,7 +495,7 @@ contract JindoTest is Test {
 
         bytes memory upSig = _signUpload(CLIENT_PK, host, client, fr, bytes32(0), outerRoot, 1024);
         vm.prank(host);
-        jindo.commitUpload(client, fr, bytes32(0), outerRoot, 1024, upSig);
+        _commitOne(client, fr, bytes32(0), outerRoot, 1024, upSig);
 
         bytes memory shortChunk = new bytes(512);
         bytes32[] memory empty = new bytes32[](0);
@@ -413,7 +511,7 @@ contract JindoTest is Test {
 
         bytes memory upSig = _signUpload(CLIENT_PK, host, client, fr, bytes32(0), outerRoot, 1024);
         vm.prank(host);
-        jindo.commitUpload(client, fr, bytes32(0), outerRoot, 1024, upSig);
+        _commitOne(client, fr, bytes32(0), outerRoot, 1024, upSig);
 
         bytes32[] memory empty = new bytes32[](0);
         vm.prank(host);
@@ -439,7 +537,7 @@ contract JindoTest is Test {
     {
         bytes memory sig = _signUpload(pk, h, c, fileRoot, bytes32(0), newRoot, size);
         vm.prank(h);
-        jindo.commitUpload(c, fileRoot, bytes32(0), newRoot, size, sig);
+        _commitOne(c, fileRoot, bytes32(0), newRoot, size, sig);
     }
 
     function test_deposit_increasesBalanceInAtto() public {
@@ -565,7 +663,7 @@ contract JindoTest is Test {
 
         bytes memory upSig = _signUpload(CLIENT_PK, host, client, fr, bytes32(0), outerRoot, 2048);
         vm.prank(host);
-        jindo.commitUpload(client, fr, bytes32(0), outerRoot, 2048, upSig);
+        _commitOne(client, fr, bytes32(0), outerRoot, 2048, upSig);
     }
 
     /// Run a real commitProof against a contract created by _setupTwoChunkContract.

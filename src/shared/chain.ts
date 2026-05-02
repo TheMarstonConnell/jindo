@@ -157,7 +157,7 @@ export async function submitClaimEarnings(
 export async function submitCommitUpload(
   ctx: ChainContext,
   client: Address,
-  fileRoot: Hex,
+  fileRoots: Hex[],
   priorRoot: Hex,
   newRoot: Hex,
   newSize: bigint,
@@ -169,7 +169,7 @@ export async function submitCommitUpload(
     address: ctx.contract,
     abi: JINDO_ABI,
     functionName: "commitUpload",
-    args: [client, fileRoot, priorRoot, newRoot, newSize, signature],
+    args: [client, fileRoots, priorRoot, newRoot, newSize, signature],
   });
   await ctx.publicClient.waitForTransactionReceipt({ hash });
   return hash;

@@ -37,7 +37,7 @@ interface Settings {
 
 const DEFAULTS: Settings = {
   hostUrl: "https://jindo.marston.dev",
-  contract: "0x7915F17C3f5BD379e76688b6b3A935097f80F423",
+  contract: "0xd4A2e52d158AEb199ecd3FcfBC749986C198F96E",
   rpcUrl: "https://sepolia.base.org",
 };
 
@@ -279,19 +279,28 @@ function App() {
       const arr = Array.from(fileList);
       if (arr.length === 0) return;
       setBanner(null);
-      for (const f of arr) {
-        setBusy(`uploading ${f.name}`);
-        try {
-          const bytes = new Uint8Array(await f.arrayBuffer());
-          const root = await client.upload(bytes);
-          await refresh(client);
-          setBanner({ kind: "ok", text: `uploaded ${f.name} → ${shortHex(root)}` });
-        } catch (e) {
-          setBanner({ kind: "error", text: e instanceof Error ? e.message : String(e) });
-          break;
-        }
+      setBusy(arr.length === 1 ? `uploading ${arr[0]!.name}` : `uploading ${arr.length} files`);
+      try {
+        const payload = await Promise.all(
+          arr.map(async (f) => ({
+            bytes: new Uint8Array(await f.arrayBuffer()),
+            filename: f.name,
+          })),
+        );
+        const { fileRoots } = await client.upload(payload);
+        await refresh(client);
+        setBanner({
+          kind: "ok",
+          text:
+            fileRoots.length === 1
+              ? `uploaded ${arr[0]!.name} → ${shortHex(fileRoots[0]!)}`
+              : `uploaded ${fileRoots.length} files in one batch`,
+        });
+      } catch (e) {
+        setBanner({ kind: "error", text: e instanceof Error ? e.message : String(e) });
+      } finally {
+        setBusy(null);
       }
-      setBusy(null);
     },
     [client, refresh],
   );

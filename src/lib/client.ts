@@ -99,63 +99,102 @@ export class JindoClient {
     return local;
   }
 
-  private async signIntent(
-    primaryType: "Upload" | "Delete",
-    message: {
-      host: Address;
-      client: Address;
-      fileRoot: Hex;
-      priorRoot: Hex;
-      newRoot: Hex;
-      newSize: bigint;
-    },
-  ): Promise<Hex> {
+  private async signUploadBatch(message: {
+    host: Address;
+    client: Address;
+    fileRoots: Hex[];
+    priorRoot: Hex;
+    newRoot: Hex;
+    newSize: bigint;
+  }): Promise<Hex> {
     const account = this.ctx.walletClient.account;
     if (!account) throw new Error("walletClient missing an account");
     return this.ctx.walletClient.signTypedData({
       account,
       domain: buildDomain(this.ctx.chainId, this.ctx.contract),
       types: TYPES,
-      primaryType,
+      primaryType: "Upload",
       message,
     });
   }
 
-  async upload(bytes: Uint8Array): Promise<Hex> {
-    if (bytes.byteLength === 0) throw new Error("cannot upload empty file");
+  private async signDelete(message: {
+    host: Address;
+    client: Address;
+    fileRoot: Hex;
+    priorRoot: Hex;
+    newRoot: Hex;
+    newSize: bigint;
+  }): Promise<Hex> {
+    const account = this.ctx.walletClient.account;
+    if (!account) throw new Error("walletClient missing an account");
+    return this.ctx.walletClient.signTypedData({
+      account,
+      domain: buildDomain(this.ctx.chainId, this.ctx.contract),
+      types: TYPES,
+      primaryType: "Delete",
+      message,
+    });
+  }
+
+  /// Upload 1+ files in a single batch. One wallet signature, one chain tx.
+  /// Pass `[bytes]` for a single file or `[a, b, c]` for multiple. Returns the
+  /// file roots in the same order they were passed.
+  async upload(
+    files: Array<Uint8Array | { bytes: Uint8Array; filename?: string }>,
+  ): Promise<{ fileRoots: Hex[]; outerRoot: Hex }> {
+    if (files.length === 0) throw new Error("cannot upload an empty batch");
+
+    // Normalize input: bytes-only entries get a synthetic name.
+    const normalized = files.map((f, i) =>
+      f instanceof Uint8Array
+        ? { bytes: f, filename: `blob-${i}` }
+        : { bytes: f.bytes, filename: f.filename ?? `blob-${i}` },
+    );
+    for (const f of normalized) {
+      if (f.bytes.byteLength === 0) throw new Error("cannot upload empty file");
+    }
+
     const local = await this.assertCacheInSync();
+    const now = Math.floor(Date.now() / 1000);
+    const newFiles: FileRecord[] = normalized.map((f) => ({
+      fileRoot: computeFileRoot(f.bytes),
+      sizeBytes: f.bytes.byteLength,
+      uploadedAt: now,
+    }));
+    const fileRoots = newFiles.map((f) => f.fileRoot);
 
-    const fileRootHex = computeFileRoot(bytes);
-    const newFile: FileRecord = {
-      fileRoot: fileRootHex,
-      sizeBytes: bytes.byteLength,
-      uploadedAt: Math.floor(Date.now() / 1000),
-    };
-    const newRoot = computeOuterRoot([...this.cache.listFiles(), newFile]);
-    const newSize = local.totalSize + BigInt(bytes.byteLength);
+    const newRoot = computeOuterRoot([...this.cache.listFiles(), ...newFiles]);
+    const newSize =
+      local.totalSize +
+      normalized.reduce((acc, f) => acc + BigInt(f.bytes.byteLength), 0n);
 
-    const signature = await this.signIntent("Upload", {
+    const signature = await this.signUploadBatch({
       host: this.hostAddress,
       client: this.clientAddress,
-      fileRoot: fileRootHex,
+      fileRoots,
       priorRoot: local.outerRoot,
       newRoot,
       newSize,
     });
 
-    const { outerRoot } = await postUpload(this.hostUrl, bytes, {
-      client: this.clientAddress,
-      fileRoot: fileRootHex,
-      priorRoot: local.outerRoot,
-      newRoot,
-      newSize: newSize.toString(),
-      signature,
-    });
+    const { outerRoot } = await postUpload(
+      this.hostUrl,
+      normalized,
+      {
+        client: this.clientAddress,
+        fileRoots,
+        priorRoot: local.outerRoot,
+        newRoot,
+        newSize: newSize.toString(),
+        signature,
+      },
+    );
 
-    this.cache.insertFile(newFile);
+    for (const f of newFiles) this.cache.insertFile(f);
     this.cache.writeState({ outerRoot, totalSize: newSize });
 
-    return fileRootHex;
+    return { fileRoots, outerRoot };
   }
 
   async delete(fileRoot: Hex): Promise<Hex> {
@@ -170,7 +209,7 @@ export class JindoClient {
     const newRoot = computeOuterRoot(remaining);
     const newSize = local.totalSize - BigInt(found.sizeBytes);
 
-    const signature = await this.signIntent("Delete", {
+    const signature = await this.signDelete({
       host: this.hostAddress,
       client: this.clientAddress,
       fileRoot: target,

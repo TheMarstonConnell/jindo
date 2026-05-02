@@ -72,7 +72,16 @@ import type { HostEnv } from "../node/env.ts";
 const DEFAULT_PROVE_INTERVAL_MS = 12 * 60 * 60 * 1000; // 12 hours
 const STARTUP_DELAY_MS = 30 * 1000; // wait 30s after startup before the first sweep
 
-interface IntentBody {
+interface UploadIntentBody {
+  client: Address;
+  fileRoots: Hex[];
+  priorRoot: Hex;
+  newRoot: Hex;
+  newSize: string;
+  signature: Hex;
+}
+
+interface DeleteIntentBody {
   client: Address;
   fileRoot: Hex;
   priorRoot: Hex;
@@ -134,19 +143,33 @@ async function handleUpload(
     return jsonError(400, "expected multipart/form-data");
   }
   const intentRaw = form.get("intent");
-  const fileField = form.get("file");
-  if (typeof intentRaw !== "string" || !(fileField instanceof Blob)) {
+  // Files arrive as File objects (Blob is the runtime type, FormDataEntryValue
+  // is the spec'd union). Either way arrayBuffer() works.
+  const fileFields = form.getAll("file").filter(
+    (f): f is File => f instanceof Blob,
+  );
+  if (typeof intentRaw !== "string" || fileFields.length === 0) {
     return jsonError(400, "missing intent or file field");
   }
 
-  let intent: IntentBody;
+  let intent: UploadIntentBody;
   try {
-    intent = JSON.parse(intentRaw) as IntentBody;
+    intent = JSON.parse(intentRaw) as UploadIntentBody;
   } catch {
     return jsonError(400, "intent is not valid JSON");
   }
 
   if (!isAddress(intent.client)) return jsonError(400, "intent.client invalid");
+  if (!Array.isArray(intent.fileRoots) || intent.fileRoots.length === 0) {
+    return jsonError(400, "intent.fileRoots must be a non-empty array");
+  }
+  if (intent.fileRoots.length !== fileFields.length) {
+    return jsonError(400, "intent.fileRoots length does not match uploaded file count", {
+      expected: intent.fileRoots.length,
+      received: fileFields.length,
+    });
+  }
+
   const client = getAddress(intent.client);
   const newSize = BigInt(intent.newSize);
   const tag = shortAddr(client);
@@ -158,7 +181,7 @@ async function handleUpload(
     {
       host: ctx.account,
       client,
-      fileRoot: intent.fileRoot,
+      fileRoots: intent.fileRoots,
       priorRoot: intent.priorRoot,
       newRoot: intent.newRoot,
       newSize,
@@ -171,7 +194,7 @@ async function handleUpload(
   }
 
   console.log(
-    `[upload] ${tag} requested: fileRoot=${shortHex(intent.fileRoot)} newTotal=${fmtBytes(newSize)}`,
+    `[upload] ${tag} requested: ${intent.fileRoots.length} file(s) newTotal=${fmtBytes(newSize)}`,
   );
 
   return withLock(client, async () => {
@@ -182,28 +205,50 @@ async function handleUpload(
       return jsonError(409, "priorRoot mismatch", { currentRoot: state.outerRoot });
     }
 
-    if (hasFile(hdb, client, intent.fileRoot)) {
-      console.log(`[upload] ${tag} file already exists — rejected (409)`);
-      return jsonError(409, "file already in set", { currentRoot: state.outerRoot });
+    // Read every uploaded blob into memory and validate each against its claimed fileRoot.
+    const blobs: Uint8Array[] = [];
+    for (let i = 0; i < fileFields.length; i++) {
+      const bytes = new Uint8Array(await fileFields[i]!.arrayBuffer());
+      const claimed = intent.fileRoots[i]!;
+      const computed = computeFileRoot(bytes);
+      if (computed.toLowerCase() !== claimed.toLowerCase()) {
+        console.log(
+          `[upload] ${tag} fileRoot mismatch at index ${i} (got ${shortHex(computed)} expected ${shortHex(claimed)}) — rejected (400)`,
+        );
+        return jsonError(400, "fileRoot does not match uploaded bytes", { index: i });
+      }
+      if (hasFile(hdb, client, claimed)) {
+        console.log(
+          `[upload] ${tag} duplicate fileRoot at index ${i} (${shortHex(claimed)}) — rejected (409)`,
+        );
+        return jsonError(409, "file already in set", {
+          fileRoot: claimed,
+          currentRoot: state.outerRoot,
+        });
+      }
+      // also reject duplicates within the batch itself
+      for (let j = 0; j < i; j++) {
+        if (intent.fileRoots[j]!.toLowerCase() === claimed.toLowerCase()) {
+          return jsonError(400, "duplicate fileRoot within batch", { fileRoot: claimed });
+        }
+      }
+      blobs.push(bytes);
     }
 
-    const bytes = new Uint8Array(await fileField.arrayBuffer());
-    const computedFileRoot = computeFileRoot(bytes);
-    if (computedFileRoot.toLowerCase() !== intent.fileRoot.toLowerCase()) {
-      console.log(`[upload] ${tag} fileRoot mismatch — rejected (400)`);
-      return jsonError(400, "fileRoot does not match uploaded bytes");
-    }
+    const newRecords = blobs.map((bytes, i) => ({
+      fileRoot: intent.fileRoots[i]!,
+      sizeBytes: bytes.byteLength,
+      uploadedAt: 0,
+    }));
 
-    const expectedNewRoot = computeOuterRoot([
-      ...listFiles(hdb, client),
-      { fileRoot: computedFileRoot, sizeBytes: bytes.byteLength, uploadedAt: 0 },
-    ]);
+    const expectedNewRoot = computeOuterRoot([...listFiles(hdb, client), ...newRecords]);
     if (expectedNewRoot.toLowerCase() !== intent.newRoot.toLowerCase()) {
       console.log(`[upload] ${tag} newRoot mismatch — rejected (400)`);
       return jsonError(400, "newRoot does not match expected outer root");
     }
 
-    const expectedNewSize = state.totalSize + BigInt(bytes.byteLength);
+    const totalNewBytes = blobs.reduce((acc, b) => acc + BigInt(b.byteLength), 0n);
+    const expectedNewSize = state.totalSize + totalNewBytes;
     if (expectedNewSize !== newSize) {
       console.log(
         `[upload] ${tag} newSize mismatch (got=${newSize} expected=${expectedNewSize}) — rejected (400)`,
@@ -214,14 +259,9 @@ async function handleUpload(
     }
 
     // Refuse the upload unless the client's on-contract balance can cover one
-    // month of storage at the new total size. Computed in atto-USDC:
-    //   required = newTotalSize × ratePerBytePerDay × 30
-    // Note this is a snapshot check. The pool is global per-client across all
-    // hosts, so other hosts could drain it later — but at this moment we know
-    // the client put up a month's worth of skin in the game for our pair.
+    // month of storage at the new total size.
     const monthlyCostAtto = newSize * rateBytePerDay * DAYS_PER_MONTH;
     const clientBalanceAtto = await readClientBalance(ctx, client);
-    const fileBytes = fmtBytes(bytes.byteLength);
     const totalBytes = fmtBytes(newSize);
     const balanceFmt = fmtUsdc(clientBalanceAtto);
     const requiredFmt = fmtUsdc(monthlyCostAtto);
@@ -239,20 +279,22 @@ async function handleUpload(
       });
     }
 
+    const batchBytes = fmtBytes(totalNewBytes);
     console.log(
       `[upload] ${tag} balance=${balanceFmt} required=${requiredFmt} (30d × ${totalBytes}) ` +
-        `— allowed; committing ${fileBytes} (file=${shortHex(intent.fileRoot)})`,
+        `— allowed; committing ${blobs.length} file(s) totaling ${batchBytes}`,
     );
 
-    const blobPath = `${hdb.blobsDir}/${intent.fileRoot}`;
-    const blobExistedBefore = existsSync(blobPath);
+    // Track which blobs we actually wrote so we can undo only those if persist fails.
+    const blobPaths = intent.fileRoots.map((root) => `${hdb.blobsDir}/${root}`);
+    const blobExistedBefore = blobPaths.map((p) => existsSync(p));
 
     let txHash: Hex;
     try {
       txHash = await submitCommitUpload(
         ctx,
         client,
-        intent.fileRoot,
+        intent.fileRoots,
         intent.priorRoot,
         intent.newRoot,
         newSize,
@@ -265,23 +307,31 @@ async function handleUpload(
     console.log(`[upload] ${tag} chain ok: tx=${txHash}`);
 
     try {
-      await Bun.write(blobPath, bytes);
+      // Write every blob first; only commit the DB once all bytes are durable.
+      for (let i = 0; i < blobs.length; i++) {
+        await Bun.write(blobPaths[i]!, blobs[i]!);
+      }
+      const now = Math.floor(Date.now() / 1000);
       const tx = hdb.db.transaction(() => {
-        insertFile(hdb, client, {
-          fileRoot: intent.fileRoot,
-          sizeBytes: bytes.byteLength,
-          uploadedAt: Math.floor(Date.now() / 1000),
-        });
+        for (let i = 0; i < intent.fileRoots.length; i++) {
+          insertFile(hdb, client, {
+            fileRoot: intent.fileRoots[i]!,
+            sizeBytes: blobs[i]!.byteLength,
+            uploadedAt: now,
+          });
+        }
         writeState(hdb, client, { outerRoot: intent.newRoot, totalSize: newSize }, txHash);
       });
       tx();
     } catch (e) {
       // Chain tx is committed but local persistence failed.
-      // Only unlink the blob if we created it on this request — otherwise another
-      // client still references it and we'd corrupt their state.
-      try {
-        if (!blobExistedBefore && existsSync(blobPath)) unlinkSync(blobPath);
-      } catch {}
+      // Only unlink blobs we created in this request — earlier-existing blobs
+      // are still referenced by other clients.
+      for (let i = 0; i < blobPaths.length; i++) {
+        try {
+          if (!blobExistedBefore[i] && existsSync(blobPaths[i]!)) unlinkSync(blobPaths[i]!);
+        } catch {}
+      }
       console.error(
         `[upload] ${tag} local persist FAILED after chain tx ${txHash}:`,
         e,
@@ -293,9 +343,11 @@ async function handleUpload(
     }
 
     console.log(
-      `[upload] ${tag} stored ${fileBytes} (file=${shortHex(intent.fileRoot)}); pair total=${totalBytes}`,
+      `[upload] ${tag} stored ${blobs.length} file(s) totaling ${batchBytes}; pair total=${totalBytes}`,
     );
-    return withCors(Response.json({ txHash, outerRoot: intent.newRoot }));
+    return withCors(
+      Response.json({ txHash, outerRoot: intent.newRoot, fileRoots: intent.fileRoots }),
+    );
   });
 }
 
@@ -304,9 +356,9 @@ async function handleDelete(
   ctx: ChainContext,
   hdb: HostDb,
 ): Promise<Response> {
-  let intent: IntentBody;
+  let intent: DeleteIntentBody;
   try {
-    intent = (await req.json()) as IntentBody;
+    intent = (await req.json()) as DeleteIntentBody;
   } catch {
     return jsonError(400, "expected JSON body");
   }

@@ -17,17 +17,27 @@ export async function fetchList(hostUrl: string, client: Address): Promise<ListR
   return (await res.json()) as ListResponse;
 }
 
+export interface UploadFile {
+  bytes: Uint8Array;
+  filename?: string;
+}
+
+/// Upload one or more files in a single multipart POST. The intent JSON
+/// references each file's hash via `fileRoots[i]` matching `files[i]` order;
+/// the server iterates form.getAll("file") in arrival order to align them.
 export async function postUpload(
   hostUrl: string,
-  bytes: Uint8Array,
+  files: UploadFile[],
   intent: unknown,
-  filename = "blob",
 ): Promise<{ txHash: Hex; outerRoot: Hex }> {
+  if (files.length === 0) throw new Error("postUpload: at least one file required");
   const form = new FormData();
   form.append("intent", JSON.stringify(intent));
-  // Cast: viem-style Uint8Array<ArrayBufferLike> isn't assignable to BlobPart's
-  // expected ArrayBufferView<ArrayBuffer>, but at runtime it's a perfectly valid Blob source.
-  form.append("file", new Blob([bytes as BlobPart]), filename);
+  for (const [i, f] of files.entries()) {
+    // Cast: viem-style Uint8Array<ArrayBufferLike> isn't assignable to BlobPart's
+    // expected ArrayBufferView<ArrayBuffer>, but at runtime it's a perfectly valid Blob source.
+    form.append("file", new Blob([f.bytes as BlobPart]), f.filename ?? `blob-${i}`);
+  }
   const res = await fetch(`${stripTrail(hostUrl)}/upload`, { method: "POST", body: form });
   if (!res.ok) throw new Error(`upload failed (${res.status}): ${await res.text()}`);
   return (await res.json()) as { txHash: Hex; outerRoot: Hex };

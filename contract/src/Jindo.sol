@@ -125,8 +125,12 @@ contract Jindo {
 
     bytes32 private constant DOMAIN_TYPEHASH =
         keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
+    // Upload signs over a batch of fileRoots — uploading 1 or N files goes
+    // through the same path. Per EIP-712, dynamic-length `bytes32[]` fields
+    // hash to keccak256(abi.encodePacked(elements)) when computing the
+    // structHash; we mirror that on chain in commitUpload.
     bytes32 private constant UPLOAD_TYPEHASH = keccak256(
-        "Upload(address host,address client,bytes32 fileRoot,bytes32 priorRoot,bytes32 newRoot,uint64 newSize)"
+        "Upload(address host,address client,bytes32[] fileRoots,bytes32 priorRoot,bytes32 newRoot,uint64 newSize)"
     );
     bytes32 private constant DELETE_TYPEHASH = keccak256(
         "Delete(address host,address client,bytes32 fileRoot,bytes32 priorRoot,bytes32 newRoot,uint64 newSize)"
@@ -242,15 +246,21 @@ contract Jindo {
     //  Storage commitments
     // ─────────────────────────────────────────────────────────────────────────────
 
+    /// Add 1+ files to a pair in a single transaction with a single client
+    /// signature. The client signs over the full bytes32[] batch (per EIP-712
+    /// dynamic-array hashing); we recompute the same digest on chain.
     function commitUpload(
         address client,
-        bytes32 fileRoot,
+        bytes32[] calldata fileRoots,
         bytes32 priorRoot,
         bytes32 newRoot,
         uint64 newSize,
         bytes calldata signature
     ) external {
-        _verifyAndCommit(UPLOAD_TYPEHASH, client, fileRoot, priorRoot, newRoot, newSize, signature);
+        if (fileRoots.length == 0) revert NoData();
+        // EIP-712 array hashing: bytes32[] hashes to keccak256(packed elements).
+        bytes32 fileRootsHash = keccak256(abi.encodePacked(fileRoots));
+        _verifyAndCommit(UPLOAD_TYPEHASH, client, fileRootsHash, priorRoot, newRoot, newSize, signature);
     }
 
     function commitDelete(

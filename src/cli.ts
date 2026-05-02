@@ -31,14 +31,22 @@ program
 
 program
   .command("upload")
-  .description("upload a file to a host")
-  .argument("<file>", "path to file")
+  .description("upload one or more files to a host in a single batch")
+  .argument("<files...>", "paths to one or more files")
   .requiredOption("--host <url>", "host URL")
-  .action(async (file: string, opts: { host: string }) => {
-    const bytes = new Uint8Array(await Bun.file(file).arrayBuffer());
+  .action(async (paths: string[], opts: { host: string }) => {
+    const files = await Promise.all(
+      paths.map(async (p) => ({
+        bytes: new Uint8Array(await Bun.file(p).arrayBuffer()),
+        filename: p.split("/").pop() ?? p,
+      })),
+    );
     const jindo = await openClient(opts.host);
-    const fileRoot = await jindo.upload(bytes);
-    console.log(`uploaded\n  fileRoot: ${fileRoot}`);
+    const { fileRoots } = await jindo.upload(files);
+    console.log(`uploaded ${fileRoots.length} file(s):`);
+    for (let i = 0; i < fileRoots.length; i++) {
+      console.log(`  ${paths[i]}  →  ${fileRoots[i]}`);
+    }
   });
 
 program
