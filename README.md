@@ -17,6 +17,7 @@ A Solidity contract (`contract/src/Jindo.sol`) is the source of truth. For every
 - [`docs/server.md`](docs/server.md) — the host HTTP server: routes, request shapes, locking, and the upload/delete flow.
 - [`docs/cli.md`](docs/cli.md) — every `jindo` subcommand, its flags, and the environment variables it expects.
 - [`docs/library.md`](docs/library.md) — the programmatic API exported from `src/lib`, with usage examples.
+- [`src/s3/README.md`](src/s3/README.md) — S3-compatible gateway that fronts a jindo host with the AWS S3 API (buckets, objects, multipart, SigV4 auth).
 
 ## Quick start
 
