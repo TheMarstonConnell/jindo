@@ -3,6 +3,14 @@ export type { JindoClientOptions, JindoClientFromContextOptions } from "./client
 export type { CacheStore, CacheFactory } from "./cache.ts";
 export { memoryCacheFactory } from "./memory-cache.ts";
 export {
+  FOLDER_KIND,
+  FOLDER_VERSION,
+  buildFolder,
+  serializeFolder,
+  tryParseFolder,
+} from "./folder.ts";
+export type { JindoFolder, JindoFolderChild } from "./folder.ts";
+export {
   fetchHostAddress,
   fetchList,
   fetchDownload,

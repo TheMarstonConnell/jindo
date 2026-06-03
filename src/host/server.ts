@@ -68,6 +68,8 @@ import {
 } from "./db.ts";
 import { proveOnce, ProofCooldownActive } from "./prove.ts";
 import type { HostEnv } from "../node/env.ts";
+import { tryParseFolder, type JindoFolder } from "../lib/folder.ts";
+import folderCss from "./folder.css" with { type: "text" };
 
 const DEFAULT_PROVE_INTERVAL_MS = 12 * 60 * 60 * 1000; // 12 hours
 const STARTUP_DELAY_MS = 30 * 1000; // wait 30s after startup before the first sweep
@@ -475,6 +477,191 @@ async function handleDownload(fileRoot: Hex, hdb: HostDb): Promise<Response> {
   return withCors(new Response(file));
 }
 
+// Folders are JSON blobs and stay small. Anything bigger than this can't
+// possibly be a folder, so we skip the parse attempt entirely. 16 MiB is
+// generous: a folder with 100k children at ~150 bytes each is still < 16 MiB.
+const MAX_FOLDER_BYTES = 16 * 1024 * 1024;
+
+const FILE_ROOT_RE = /^0x[0-9a-fA-F]{64}$/;
+
+function htmlEscape(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function extToMime(filename: string): string {
+  const dot = filename.lastIndexOf(".");
+  if (dot < 0) return "application/octet-stream";
+  const ext = filename.slice(dot + 1).toLowerCase();
+  switch (ext) {
+    case "txt": case "log": return "text/plain; charset=utf-8";
+    case "md": return "text/markdown; charset=utf-8";
+    case "html": case "htm": return "text/html; charset=utf-8";
+    case "css": return "text/css; charset=utf-8";
+    case "js": case "mjs": return "text/javascript; charset=utf-8";
+    case "json": return "application/json; charset=utf-8";
+    case "xml": return "application/xml; charset=utf-8";
+    case "csv": return "text/csv; charset=utf-8";
+    case "pdf": return "application/pdf";
+    case "png": return "image/png";
+    case "jpg": case "jpeg": return "image/jpeg";
+    case "gif": return "image/gif";
+    case "webp": return "image/webp";
+    case "svg": return "image/svg+xml";
+    case "ico": return "image/x-icon";
+    case "mp3": return "audio/mpeg";
+    case "wav": return "audio/wav";
+    case "ogg": return "audio/ogg";
+    case "mp4": return "video/mp4";
+    case "webm": return "video/webm";
+    case "zip": return "application/zip";
+    case "wasm": return "application/wasm";
+    default: return "application/octet-stream";
+  }
+}
+
+async function readPossibleFolder(blobPath: string): Promise<JindoFolder | null> {
+  const file = Bun.file(blobPath);
+  if (!(await file.exists())) return null;
+  const size = file.size;
+  if (size === 0 || size > MAX_FOLDER_BYTES) return null;
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  return tryParseFolder(bytes);
+}
+
+function fmtSize(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+
+function renderBreadcrumb(rootId: string, walked: string[]): string {
+  // walked = path segments AFTER the rootId. Returns clickable breadcrumb
+  // links that walk back up the directory hierarchy.
+  const parts: string[] = [];
+  const rootHref = `/serve/${encodeURIComponent(rootId)}`;
+  parts.push(`<a href="${htmlEscape(rootHref)}">${htmlEscape(rootId.slice(0, 10))}…</a>`);
+  let acc = rootHref;
+  for (const seg of walked) {
+    acc += "/" + encodeURIComponent(seg);
+    parts.push(`<a href="${htmlEscape(acc)}">${htmlEscape(seg)}</a>`);
+  }
+  return parts.join('<span class="sep">/</span>');
+}
+
+function renderFolderHtml(folder: JindoFolder, urlSegments: string[]): Response {
+  // urlSegments[0] is the root id; the rest are the path walked to reach
+  // this folder. Every child link re-uses that prefix so the server can
+  // re-walk the path on each click.
+  const rootId = urlSegments[0]!;
+  const walked = urlSegments.slice(1);
+  const prefix = "/" + ["serve", ...urlSegments].map(encodeURIComponent).join("/");
+
+  const rows = folder.children.map((c) => {
+    const href = `${prefix}/${encodeURIComponent(c.name)}`;
+    const idHref = `/serve/${encodeURIComponent(c.id)}`;
+    return `<div class="row entry">
+  <div class="cell name"><a href="${htmlEscape(href)}">${htmlEscape(c.name)}</a></div>
+  <div class="cell id" title="${htmlEscape(c.id)}"><a href="${htmlEscape(idHref)}">${htmlEscape(c.id)}</a></div>
+  <div class="cell size">${fmtSize(c.size)}</div>
+</div>`;
+  }).join("");
+
+  const listing = folder.children.length === 0
+    ? `<div class="empty">empty folder</div>`
+    : rows;
+
+  const breadcrumb = walked.length > 0
+    ? `<div class="breadcrumb">${renderBreadcrumb(rootId, walked)}</div>`
+    : "";
+
+  const body = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${htmlEscape(folder.name)}</title>
+<style>${folderCss}</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <h1 class="title">${htmlEscape(folder.name)}</h1>
+    <div class="meta">
+      <span>${folder.children.length} item${folder.children.length === 1 ? "" : "s"}</span>
+      <span>total size: ${fmtSize(folder.size)}</span>
+    </div>
+  </div>
+  ${breadcrumb}
+  <div class="listing" role="table">
+    <div class="row head" role="row">
+      <div class="cell" role="columnheader">name</div>
+      <div class="cell id-h" role="columnheader">id</div>
+      <div class="cell size" role="columnheader">total size</div>
+    </div>
+    ${listing}
+  </div>
+</div>
+</body>
+</html>`;
+
+  return withCors(new Response(body, {
+    headers: { "Content-Type": "text/html; charset=utf-8" },
+  }));
+}
+
+async function handleServe(req: Request, hdb: HostDb): Promise<Response> {
+  const url = new URL(req.url);
+  const rest = url.pathname.replace(/^\/serve\/?/, "");
+  const rawSegments = rest.split("/");
+  const segments = rawSegments
+    .filter((s) => s.length > 0)
+    .map((s) => decodeURIComponent(s));
+
+  if (segments.length === 0) return jsonError(400, "missing id");
+  const id = segments[0]!;
+  if (!FILE_ROOT_RE.test(id)) return jsonError(400, "invalid id");
+
+  let currentId = id as Hex;
+  let currentName: string | null = null;
+
+  // Walk path segments past the id, resolving each through the folder JSON
+  // we land on. If we hit a non-folder before consuming all segments, the
+  // path is invalid.
+  for (let i = 1; i < segments.length; i++) {
+    const segName = segments[i]!;
+    if (!blobIsLive(hdb, currentId)) return jsonError(404, "not found");
+    const folder = await readPossibleFolder(`${hdb.blobsDir}/${currentId}`);
+    if (!folder) return jsonError(404, "path passes through a non-folder");
+    const child = folder.children.find((c) => c.name === segName);
+    if (!child) return jsonError(404, `child not found: ${segName}`);
+    currentId = child.id;
+    currentName = segName;
+  }
+
+  if (!blobIsLive(hdb, currentId)) return jsonError(404, "not found");
+  const blobPath = `${hdb.blobsDir}/${currentId}`;
+  const folder = await readPossibleFolder(blobPath);
+  if (folder) {
+    return renderFolderHtml(folder, segments);
+  }
+
+  const file = Bun.file(blobPath);
+  if (!(await file.exists())) return jsonError(404, "not found");
+  const headers = new Headers();
+  headers.set(
+    "Content-Type",
+    currentName ? extToMime(currentName) : "application/octet-stream",
+  );
+  return withCors(new Response(file, { headers }));
+}
+
 interface RootInfo {
   ctx: ChainContext;
   hdb: HostDb;
@@ -504,6 +691,7 @@ function handleRoot(info: RootInfo): Response {
       "GET /clients": "all known clients on this host",
       "GET /list/:client": "files for a client",
       "GET /download/:fileRoot": "stream a blob",
+      "GET /serve/:id[/path...]": "browse blob; folder JSONs render as HTML",
       "POST /upload": "multipart: signed intent + bytes",
       "POST /delete": "JSON: signed delete intent",
     },
@@ -593,7 +781,17 @@ export async function startHost(env: HostEnv): Promise<{ stop: () => void; url: 
         OPTIONS: corsPreflight,
       },
     },
-    fetch: () => new Response("not found", { status: 404 }),
+    fetch: (req) => {
+      const url = new URL(req.url);
+      if (url.pathname === "/serve" || url.pathname.startsWith("/serve/")) {
+        if (req.method === "OPTIONS") return corsPreflight();
+        if (req.method === "GET" || req.method === "HEAD") {
+          return handleServe(req, hdb);
+        }
+        return jsonError(405, "method not allowed");
+      }
+      return new Response("not found", { status: 404 });
+    },
   });
 
   console.log(

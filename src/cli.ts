@@ -10,6 +10,7 @@ import { prove } from "./host/prove.ts";
 import { withdrawAll } from "./host/withdraw.ts";
 import { loadClient, loadHost, loadS3Gateway } from "./node/env.ts";
 import { sqliteCacheFactory } from "./node/sqlite-cache.ts";
+import { uploadFolderFromDir } from "./node/folder-upload.ts";
 
 /// Parse a USDC string (e.g. "1.5", "100", "0.000001") into 6-decimal base units.
 /// Throws on bad input or excess precision.
@@ -71,6 +72,21 @@ program
     for (let i = 0; i < fileRoots.length; i++) {
       console.log(`  ${paths[i]}  →  ${fileRoots[i]}`);
     }
+  });
+
+program
+  .command("upload-folder")
+  .description(
+    "recursively upload a directory as a Jindo folder (single signed batch)",
+  )
+  .argument("<dir>", "path to a local directory")
+  .requiredOption("--host <url>", "host URL")
+  .action(async (dir: string, opts: { host: string }) => {
+    const jindo = await openClient(opts.host);
+    const { folderRoot, uploadedRoots } = await uploadFolderFromDir(jindo, dir);
+    console.log(`folder root: ${folderRoot}`);
+    console.log(`uploaded ${uploadedRoots.length} new blob(s)`);
+    console.log(`browse:      ${opts.host.replace(/\/$/, "")}/serve/${folderRoot}`);
   });
 
 program
