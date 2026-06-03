@@ -180,6 +180,8 @@ contract Jindo {
     }
 
     function key(address host, address client) public pure returns (bytes32 result) {
+        // intentional inline asm: cheap 40-byte (host||client) keccak key derivation.
+        // slither-disable-next-line assembly
         assembly {
             // Layout 40 bytes: host (20) || client (20) at memory[0..40), then hash.
             mstore(0x00, shl(96, host))
@@ -302,7 +304,10 @@ contract Jindo {
     }
 
     /// @notice Host commits a data-availability proof for the current challenge.
-    /// @dev On success, settles accrual and rotates the challenge.
+    /// @dev On success, settles accrual and rotates the challenge. The proof
+    /// guards are deliberately inlined here for gas and auditability, which
+    /// pushes cyclomatic complexity past Slither's default threshold.
+    // slither-disable-next-line cyclomatic-complexity
     function commitProof(
         address client,
         uint256 cumulativeBytesBefore,
@@ -425,6 +430,8 @@ contract Jindo {
         uint256 len = proof.length;
         for (uint256 i; i < len;) {
             bytes32 sib = proof[i];
+            // intentional inline asm: sorted-pair keccak, the hot loop of proof verification.
+            // slither-disable-next-line assembly
             assembly {
                 switch lt(computed, sib)
                 case 1 {
@@ -449,6 +456,8 @@ contract Jindo {
         bytes32 r;
         bytes32 s;
         uint8 v;
+        // intentional inline asm: split the 65-byte signature into r/s/v without abi.decode.
+        // slither-disable-next-line assembly
         assembly {
             r := calldataload(signature.offset)
             s := calldataload(add(signature.offset, 0x20))
