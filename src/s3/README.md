@@ -4,6 +4,11 @@ An S3-compatible HTTP server that stores object bytes on a jindo host. Buckets, 
 
 The gateway holds **one** on-chain identity (the wallet from `JINDO_PRIVATE_KEY`); every S3 caller's data is stored under it. The S3 credentials in the database only gate access to the gateway — they don't correspond to separate on-chain identities.
 
+> **New to jindo?** The gateway sits in front of a normal jindo host, so you need
+> a running host first. Do the [Getting Started runbook](../../docs/getting-started.md)
+> to stand one up, then come back here. For how the underlying storage and
+> payments work, see [Concepts](../../docs/concepts.md).
+
 ## Run it
 
 ```bash

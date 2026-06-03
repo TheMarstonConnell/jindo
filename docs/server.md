@@ -1,98 +1,152 @@
-# Host server
+# Host HTTP API
 
-The host server lives in `src/host/server.ts` and runs on `Bun.serve`. It is started by `jindo start`, which calls `startHost(env)` with configuration loaded from environment variables.
+The host server lives in `src/host/server.ts` and runs on `Bun.serve`. It's
+started by `jindo start`, which calls `startHost(env)` with configuration from
+the environment. This page documents the wire API; for *operating* a host see
+[host-operations.md](host-operations.md), and for the concepts behind the flow
+see [concepts.md](concepts.md).
 
-A host serves one address (its own) but many clients. For every client that has ever uploaded to it, the host keeps an isolated SQLite database under `JINDO_DATA_DIR/{clientAddress}/db.sqlite` plus a `blobs/` directory that holds the file content. The on-chain Jindo contract is the source of truth for the outer Merkle root and total size of each `(host, client)` pair; the host's database is a cache of that state plus the actual bytes.
+A host serves one address (its own) and many clients. The on-chain Jindo contract
+is the source of truth for each pair's outer Merkle root and total size; the
+host's local database is a cache of that state plus the actual bytes. State is
+stored under `JINDO_DATA_DIR`: a single `host.sqlite` and a content-addressed,
+de-duplicated `blobs/` directory shared across all clients.
 
-## Configuration
-
-| Variable | Required | Default | Purpose |
-|---|---|---|---|
-| `JINDO_PRIVATE_KEY` | yes | — | Host signing key, used to submit on-chain transactions. |
-| `JINDO_RPC_URL` | yes | — | RPC endpoint for the chain the contract is deployed on. |
-| `JINDO_CONTRACT` | yes | — | Address of the deployed Jindo contract. |
-| `JINDO_PORT` | no | `5689` | Port to bind. |
-| `JINDO_DATA_DIR` | no | `./data` | Where per-client SQLite databases and blob files live. |
-
-On startup the server resolves the chain ID via viem, builds a public and wallet client, and prints a line like:
-
-```
-jindo host listening on http://0.0.0.0:5689 as 0xHOST... (chain 84532, contract 0xCONTRACT...)
-```
+All responses include permissive CORS headers (`Access-Control-Allow-Origin: *`),
+so a browser app can talk to a host directly. Errors are JSON of the shape
+`{ "error": "...", ...extra }`.
 
 ## Concurrency
 
-State for a single client is serialized through a `withLock(client, fn)` helper that maps a client address to a promise chain. Two uploads for different clients can run in parallel; two uploads for the same client are forced to run one after the other. This is what keeps the local cache, the on-chain root, and the file blobs consistent under load.
+Writes for a single client are serialized through a `withLock(client, fn)` helper
+that chains promises per client address. Uploads/deletes for *different* clients
+run in parallel; for the *same* client they run one at a time. That, plus the
+optimistic `priorRoot` check, keeps the local cache, the on-chain root, and the
+blobs consistent under load — no global lock needed.
 
 ## Routes
 
+### `GET /`
+
+Rich operator status — identity, chain, USDC token, live stats, and a map of the
+other endpoints:
+
+```json
+{
+  "host": "0xHOST...",
+  "chain": { "id": 84532, "name": "Base Sepolia" },
+  "contract": "0xCONTRACT...",
+  "usdc": "0xUSDC...",
+  "status": { "clients": 3, "totalBytes": "12345", "totalBytesHuman": "12.1 KB", "uptimeSeconds": 3600 },
+  "endpoints": { "GET /health": "JSON status", "...": "..." }
+}
+```
+
+### `GET /health`
+
+Liveness plus the host's identity. Clients call this on first contact to learn the
+host's address — they need it before they can sign an `Upload`/`Delete` intent
+that names the host.
+
+```json
+{ "address": "0xHOST...", "chainId": 84532, "contract": "0xCONTRACT..." }
+```
+
 ### `POST /upload`
 
-The core write path. The body is `multipart/form-data` with two parts:
+The core write path. Body is `multipart/form-data` with:
 
-- `intent` — JSON string with `client`, `fileRoot`, `priorRoot`, `newRoot`, `newSize`, `signature`.
-- `file` — the raw bytes.
+- `intent` — a JSON string: `{ client, fileRoots, priorRoot, newRoot, newSize, signature }`.
+- `file` — one or more file parts (repeat the field for a batch). The order must
+  match `intent.fileRoots`.
 
 The handler runs, in order:
 
-1. Recover the EIP-712 signer from `signature` and confirm it equals `intent.client`.
-2. Acquire the per-client lock.
-3. Read on-chain state for `(host, client)` and confirm the host's local cache matches it. If they have drifted, the request is refused.
-4. Confirm `intent.priorRoot` equals the current outer root. A mismatch returns `409` with the current root.
-5. Recompute the file root from the uploaded bytes and confirm it matches `intent.fileRoot`.
-6. Add the file to the in-memory file list, recompute the outer root and total size, and confirm both match `intent.newRoot` / `intent.newSize`.
-7. Submit `commitUpload` to the contract via viem and wait for the receipt.
-8. In a single SQLite transaction, write the blob to disk, insert the file row, and update the state row with the new outer root and tx hash.
+1. Recover the EIP-712 signer from `signature` and confirm it equals
+   `intent.client`. (Mismatch → `401`.)
+2. Acquire the per-client lock; confirm the local cache matches on-chain state.
+3. Confirm `intent.priorRoot` equals the current outer root. (Mismatch → `409`
+   with `currentRoot`.)
+4. Recompute each file root from the uploaded bytes and confirm it matches
+   `intent.fileRoots[i]`; reject duplicates (already stored, or repeated in the
+   batch).
+5. Recompute the post-upload outer root and total size; confirm both match
+   `intent.newRoot` / `intent.newSize`.
+6. **Check the client's on-chain USDC balance covers at least 30 days** of
+   storage at the new total size. (Short → `402`.)
+7. Submit `commitUpload` to the contract and wait for the receipt.
+8. Only then: write every blob to disk and, in one SQLite transaction, insert the
+   file rows and update the pair's state with the new root and tx hash.
 
-A `200` response carries `{ txHash, outerRoot }`. Failures use `400` (malformed or invalid intent), `401` (signature does not match `client`), `409` (stale `priorRoot`), `502` (chain submission failed), or `500` (chain confirmed but local persistence failed — the host flags this as an inconsistency to investigate).
+Success → `200 { txHash, outerRoot, fileRoots }`. Errors: `400` (malformed or
+invalid intent / root / size mismatch), `401` (bad signature), `402` (client
+balance too low), `409` (stale `priorRoot` or duplicate file), `502` (chain
+submission failed), `500` (chain confirmed but local persistence failed — flagged
+as an inconsistency to investigate).
 
 ### `POST /delete`
 
-Same shape as upload but no file part — only the JSON body. The handler verifies the signature, confirms the file exists in the current set, recomputes the outer root and size after removal, calls `commitDelete` on the contract, then atomically deletes the database row and the blob. The response is `{ txHash, outerRoot }`.
+Same idea, JSON body only (no file part):
+`{ client, fileRoot, priorRoot, newRoot, newSize, signature }`. Verifies the
+signature, confirms the file exists and the post-deletion root/size match, calls
+`commitDelete`, then deletes the row and — only if no other client still
+references the bytes — the blob. Success → `200 { txHash, outerRoot }`.
 
 ### `GET /list/:client`
 
-Returns the host's view of what it is storing for a given client:
+The host's view of what it stores for a client. This is the basis for
+`jindo recover`: the client re-verifies every field against the on-chain root
+before trusting it.
 
 ```json
 {
   "outerRoot": "0x...",
   "totalSize": "4096",
-  "files": [
-    { "fileRoot": "0x...", "sizeBytes": 1024, "uploadedAt": 1735689600 }
-  ]
+  "files": [ { "fileRoot": "0x...", "sizeBytes": 1024, "uploadedAt": 1735689600 } ]
 }
 ```
 
-`totalSize` is a string because JSON cannot represent a `bigint` natively. This route is the basis for `jindo recover` — the client pulls this list and verifies every field of it against the on-chain root before trusting it.
+`totalSize` is a string because JSON can't represent a `bigint` natively.
 
-### `GET /download/:client/:fileRoot`
+### `GET /download/:fileRoot`
 
-Returns the raw bytes of a stored file, or `404` if the file is not present. There is no authentication on this route: anyone holding a `fileRoot` can fetch the bytes, so do not use a host as a confidential store. If you want privacy, encrypt before uploading.
+Returns the raw bytes of a stored blob, or `404`. **No authentication** — anyone
+with a `fileRoot` can fetch the bytes. Don't use a host as a confidential store;
+encrypt before uploading if you need privacy. (A blob deleted by every client is
+removed, so stale roots `404`.)
+
+### `GET /serve/:id[/path...]`
+
+Browse a blob in a web browser. If the blob is a **folder manifest** (produced by
+`jindo upload-folder`), it renders as a clickable HTML directory listing; path
+segments after the id walk into subfolders by name. If the blob is a regular file,
+it's served inline with a best-effort `Content-Type` guessed from the path's
+extension.
+
+```
+http://localhost:5689/serve/0xFOLDERROOT.../docs/readme.md
+```
 
 ### `GET /clients`
 
-Enumerates every client directory the host has data for and returns a summary:
+Every client the host has data for, with a per-client summary — useful for
+operators inspecting a host.
 
 ```json
 {
   "host": "0x...",
-  "clients": [
-    { "client": "0x...", "outerRoot": "0x...", "totalSize": "4096", "fileCount": 2 }
-  ]
+  "clients": [ { "client": "0x...", "outerRoot": "0x...", "totalSize": "4096", "fileCount": 2 } ]
 }
 ```
 
-Useful for operators inspecting a host.
+## Automatic proof sweeps
 
-### `GET /health`
-
-Returns `{ address, chainId, contract }`. Clients call this on first contact to learn the host's address (which they need before they can sign an EIP-712 intent that names the host).
-
-## Error model
-
-Every error response is JSON of the shape `{ error: "...", ...extra }`, returned by the internal `jsonError(status, message, extra)` helper. The most useful `extra` field is the current `outerRoot` returned with a `409`, which lets a client re-sync without an extra round trip.
+Beyond serving requests, `startHost` runs a background timer that proves each
+client's data to the contract (so the host gets paid). It's controlled by
+`JINDO_PROVE_INTERVAL_MS` (default 12h; `0` disables). See
+[host-operations.md](host-operations.md#earning-proofs-and-claims).
 
 ## Shutdown
 
-`startHost` returns `{ stop, url }`. Calling `stop()` closes the Bun server. The CLI does not currently wire this to a signal handler — `Ctrl-C` is the supported way to stop a long-running host.
+`startHost` returns `{ stop, url }`. `stop()` cancels the proof timer and closes
+the server. The CLI relies on `Ctrl-C` to stop a long-running host.
